@@ -48,7 +48,9 @@ The Flux node patches selected **MMDiT double/single blocks** through ComfyUI's 
 - double-stream blocks: modulates `txt`
 - single-stream blocks: modulates the text-prefix slice inside the merged stream
 
-Default preset:
+The paper sparse preset is authored for canonical FLUX.1 block counts (`19` double + `38` single). This repo now **auto-remaps** those paper indices to the currently loaded Flux-family model when `block_preset = paper_sparse_flux`.
+
+Default paper preset source indices:
 
 ```text
 1, 15, 36, 41, 48
@@ -58,6 +60,8 @@ For a standard FLUX 57-block layout, this maps to:
 
 - double blocks: `0, 14`
 - single blocks: `16, 21, 28`
+
+For reduced Flux.2 layouts, the remapped indices are smaller. By default, **single-stream patching is disabled** because the current sparse approximation is stable on double-stream blocks first, while single-stream behavior is more architecture-sensitive.
 
 ### SDXL node
 
@@ -136,6 +140,8 @@ Restart ComfyUI.
   - `linear`
   - `exponential`
 - `token_tail` (`FLOAT`, default `0.35`)
+- `apply_single_stream` (`BOOLEAN`, default `False`)
+  - recommended to leave disabled for Flux.2-first use until a model-specific single-stream strategy is validated
 
 ### Outputs
 
@@ -152,6 +158,7 @@ Closest to the sparse strategy described in the paper appendix:
 - `sigma_start = 0.0`
 - `sigma_end = 1.0`
 - `sigma_ramp = 0.0`
+- `apply_single_stream = False`
 
 ### Example
 
