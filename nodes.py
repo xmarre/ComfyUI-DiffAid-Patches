@@ -113,8 +113,6 @@ def _remap_stage_indices(indices_1based: Sequence[int], source_total: int, targe
         raise ValueError(f"source_total must be positive, got {source_total}.")
     if target_total <= 0:
         raise ValueError(f"target_total must be positive, got {target_total}.")
-    if source_total == 1 or target_total == 1:
-        return [1 for _ in indices_1based]
 
     out: List[int] = []
     for index_1based in indices_1based:
@@ -122,6 +120,9 @@ def _remap_stage_indices(indices_1based: Sequence[int], source_total: int, targe
             raise ValueError(
                 f"Stage-local block index {index_1based} is outside the source range 1..{source_total}."
             )
+        if source_total == 1 or target_total == 1:
+            out.append(1)
+            continue
         scaled = round((index_1based - 1) * (target_total - 1) / (source_total - 1)) + 1
         out.append(int(scaled))
     return _dedupe_preserve_order(out)
