@@ -9,6 +9,8 @@ import torch.nn as nn
 
 
 PAPER_SPARSE_FLUX_COMBINED_BLOCKS: Tuple[int, ...] = (1, 15, 36, 41, 48)
+PAPER_SOURCE_FLUX_DOUBLE_BLOCKS = 19
+PAPER_SOURCE_FLUX_SINGLE_BLOCKS = 38
 STATE_KEY = "diffaid_runtime_state"
 
 
@@ -104,6 +106,44 @@ def _parse_sdxl_targets(text: str) -> Tuple[SdxlTargetSpec, ...]:
                 raise ValueError(f"Invalid transformer index in target '{part}'. Must be >= 0.")
         out.append(SdxlTargetSpec(stage=stage, block_number=block_number, transformer_index=transformer_index))
     return tuple(out)
+
+
+def _remap_stage_indices(indices_1based: Sequence[int], source_total: int, target_total: int) -> List[int]:
+    if source_total <= 0:
+        raise ValueError(f"source_total must be positive, got {source_total}.")
+    if target_total <= 0:
+        raise ValueError(f"target_total must be positive, got {target_total}.")
+
+    out: List[int] = []
+    for index_1based in indices_1based:
+        if index_1based <= 0 or index_1based > source_total:
+            raise ValueError(
+                f"Stage-local block index {index_1based} is outside the source range 1..{source_total}."
+            )
+        if source_total == 1 or target_total == 1:
+            out.append(1)
+            continue
+        scaled = round((index_1based - 1) * (target_total - 1) / (source_total - 1)) + 1
+        out.append(int(scaled))
+    return _dedupe_preserve_order(out)
+
+
+def _remap_paper_sparse_flux_indices(total_double: int, total_single: int) -> List[int]:
+    source_double = [
+        index
+        for index in PAPER_SPARSE_FLUX_COMBINED_BLOCKS
+        if index <= PAPER_SOURCE_FLUX_DOUBLE_BLOCKS
+    ]
+    source_single = [
+        index - PAPER_SOURCE_FLUX_DOUBLE_BLOCKS
+        for index in PAPER_SPARSE_FLUX_COMBINED_BLOCKS
+        if index > PAPER_SOURCE_FLUX_DOUBLE_BLOCKS
+    ]
+
+    mapped_double = _remap_stage_indices(source_double, PAPER_SOURCE_FLUX_DOUBLE_BLOCKS, total_double)
+    mapped_single_local = _remap_stage_indices(source_single, PAPER_SOURCE_FLUX_SINGLE_BLOCKS, total_single)
+    mapped_single_combined = [total_double + index for index in mapped_single_local]
+    return _dedupe_preserve_order([*mapped_double, *mapped_single_combined])
 
 
 def _smoothstep01(x: torch.Tensor) -> torch.Tensor:
@@ -432,6 +472,13 @@ class Flux2DiffAidSparsePatchNode:
                         "advanced": True,
                     },
                 ),
+                "apply_single_stream": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "advanced": True,
+                    },
+                ),
             }
         }
 
@@ -452,6 +499,7 @@ class Flux2DiffAidSparsePatchNode:
         sigma_ramp: float,
         token_weight_mode: str,
         token_tail: float,
+        apply_single_stream: bool,
     ):
         if not enabled:
             return model, "disabled"
@@ -464,13 +512,26 @@ class Flux2DiffAidSparsePatchNode:
         if sigma_start > sigma_end:
             raise ValueError(f"sigma_start ({sigma_start}) must be <= sigma_end ({sigma_end}).")
 
-        if block_preset == "paper_sparse_flux":
-            combined_indices = list(PAPER_SPARSE_FLUX_COMBINED_BLOCKS)
-        else:
-            combined_indices = _parse_combined_block_indices(block_indices)
-
         total_double, total_single = _get_flux_block_counts(model)
+
+        if block_preset == "paper_sparse_flux":
+            requested_combined_indices = list(PAPER_SPARSE_FLUX_COMBINED_BLOCKS)
+            combined_indices = _remap_paper_sparse_flux_indices(total_double, total_single)
+            preset_name = (
+                "paper_sparse_flux_remapped_from_flux1"
+                f"(source_double={PAPER_SOURCE_FLUX_DOUBLE_BLOCKS},source_single={PAPER_SOURCE_FLUX_SINGLE_BLOCKS})"
+            )
+        else:
+            requested_combined_indices = _parse_combined_block_indices(block_indices)
+            combined_indices = requested_combined_indices
+            preset_name = "custom_combined_indices"
+
         mapped = _map_combined_indices_to_flux_stages(combined_indices, total_double, total_single)
+        active_single_0based = mapped.single_0based if apply_single_stream else tuple()
+        active_combined_1based = tuple(
+            [index + 1 for index in mapped.double_0based]
+            + [mapped.total_double + index + 1 for index in active_single_0based]
+        )
         config = SharedConfig(
             strength=float(strength),
             sigma_start=float(sigma_start),
@@ -493,18 +554,21 @@ class Flux2DiffAidSparsePatchNode:
                 block_index,
             )
 
-        for block_index in mapped.single_0based:
-            existing_patch = _get_existing_flux_replace_patch(patched, "single", block_index)
-            patched.set_model_patch_replace(
-                FluxBlockReplacePatch("single", block_index, config, existing_patch=existing_patch),
-                "dit",
-                "single_block",
-                block_index,
-            )
+        if apply_single_stream:
+            for block_index in mapped.single_0based:
+                existing_patch = _get_existing_flux_replace_patch(patched, "single", block_index)
+                patched.set_model_patch_replace(
+                    FluxBlockReplacePatch("single", block_index, config, existing_patch=existing_patch),
+                    "dit",
+                    "single_block",
+                    block_index,
+                )
 
         summary = (
-            f"flux_sparse preset={block_preset}; combined_blocks=[{_fmt_ints(mapped.combined_1based)}]; "
-            f"double_blocks_0based=[{_fmt_ints(mapped.double_0based)}]; single_blocks_0based=[{_fmt_ints(mapped.single_0based)}]; "
+            f"flux_sparse preset={preset_name}; requested_combined_blocks=[{_fmt_ints(requested_combined_indices)}]; "
+            f"active_combined_blocks=[{_fmt_ints(active_combined_1based)}]; "
+            f"double_blocks_0based=[{_fmt_ints(mapped.double_0based)}]; single_blocks_0based=[{_fmt_ints(active_single_0based)}]; "
+            f"apply_single_stream={str(bool(apply_single_stream)).lower()}; "
             f"strength={config.strength:.3f}; sigma_window=[{config.sigma_start:.3f}, {config.sigma_end:.3f}] ramp={config.sigma_ramp:.3f}; "
             f"token_weight_mode={config.token_weight_mode}; token_tail={config.token_tail:.3f}; "
             f"model_total_blocks={mapped.total} (double={mapped.total_double}, single={mapped.total_single})"
