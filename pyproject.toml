@@ -1,0 +1,17 @@
+[project]
+name = "diffaid-patches"
+description = "A ComfyUI custom node pack implementing Diff-Aid-inspired inference-time text-conditioning patches for Flux and SDXL models."
+version = "1.0.0"
+license = { file = "LICENSE" }
+
+[project.urls]
+Repository = "https://github.com/xmarre/ComfyUI-DiffAid-Patches"
+Documentation = "https://github.com/xmarre/ComfyUI-DiffAid-Patches/wiki"
+"Bug Tracker" = "https://github.com/xmarre/ComfyUI-DiffAid-Patches/issues"
+
+[tool.comfy]
+PublisherId = "xmarre"
+DisplayName = "ComfyUI-DiffAid-Patches"
+Icon = ""
+includes = []
+# "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
