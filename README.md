@@ -4,7 +4,7 @@ ComfyUI custom nodes that apply **Diff-Aid-inspired inference-time text-conditio
 
 This repository is a **practical patch pack for ComfyUI inference**, not a paper-exact reproduction of the original Diff-Aid training method. It currently provides two nodes:
 
-- **Flux.2 Diff-Aid Sparse Patch** — for Flux-family MMDiT models exposed through ComfyUI as `double_blocks` / `single_blocks`
+- **Flux-family Diff-Aid Sparse Patch** — for Flux-family MMDiT models exposed through ComfyUI as `double_blocks` / `single_blocks`
 - **SDXL Diff-Aid Cross-Attention Patch** — for SDXL-style cross-attention U-Nets, as an architectural adaptation of the same high-level idea
 
 ---
@@ -13,8 +13,8 @@ This repository is a **practical patch pack for ComfyUI inference**, not a paper
 
 This repository is based on ideas from:
 
-> **Binglei Li, Mengping Yang, Zhiyu Tan, Junping Zhang, Hao Li**  
-> **Diff-Aid: Inference-time Adaptive Interaction Denoising for Rectified Text-to-Image Generation**  
+> **Binglei Li, Mengping Yang, Zhiyu Tan, Junping Zhang, Hao Li**
+> **Diff-Aid: Inference-time Adaptive Interaction Denoising for Rectified Text-to-Image Generation**
 > arXiv:2602.13585, 2026  
 > https://arxiv.org/abs/2602.13585
 
@@ -106,8 +106,9 @@ c' = c + c * α
 
 - construct `α` from user-controlled terms:
   - a base `strength`
-  - an optional normalized sigma / timestep window
+  - a normalized sigma-level window
   - optional token-position weighting
+  - optional conditional-branch filtering
 
 ### Important caveat
 
@@ -163,7 +164,7 @@ Clone into `ComfyUI/custom_nodes`:
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone <your-repo-url> ComfyUI-DiffAid-Patches
+git clone https://github.com/xmarre/ComfyUI-DiffAid-Patches ComfyUI-DiffAid-Patches
 ```
 
 No additional Python packages are required beyond a normal ComfyUI installation.
@@ -172,7 +173,7 @@ Restart ComfyUI after installation.
 
 ---
 
-## Node 1: Flux.2 Diff-Aid Sparse Patch
+## Node 1: Flux-family Diff-Aid Sparse Patch
 
 **Type:** `MODEL -> MODEL`
 
@@ -183,27 +184,31 @@ This node targets **Flux-family models** that expose the expected diffusion tran
 The node uses ComfyUI model patch hooks to modify selected Flux transformer blocks:
 
 - **double-stream blocks**: modulates the `txt` tensor directly
-- **single-stream blocks**: modulates the text-prefix region inside the merged stream when the required slice metadata is available
+- **single-stream blocks**: modulates only the text-prefix region inside the merged stream, when the required slice metadata is available
 
-It also wraps the model call to capture the current timestep into transformer options so timestep-gated modulation can be applied inside the patch.
+Image latent tokens and reference latent tokens are left untouched. If reference latents are present at runtime, the node logs that it detected them and confirms the text-only modulation scope.
+
+The node wraps the model call to derive a normalized sigma level for the current sampling run. The wrapper composes by wrapping the final `model_function`, so existing ComfyUI or third-party wrappers still get first chance to adjust call parameters.
 
 ### Inputs
 
 - `model` — input `MODEL`
 - `enabled` — bypass switch
 - `block_preset`
-  - `paper_sparse_flux`
+  - `paper_sparse_flux_double_only_safe`
+  - `paper_sparse_flux_full`
   - `custom_combined_indices`
 - `block_indices` — comma-separated 1-based combined block indices, used for `custom_combined_indices`
 - `strength` — modulation magnitude
-- `sigma_start`, `sigma_end` — normalized active timestep window
-- `sigma_ramp` — soft edge width for the sigma window
+- `sigma_start`, `sigma_end` — normalized sigma-level active window, where `1.0` is the first/high-noise model call in the current run and `0.0` is the low-noise end
+- `sigma_ramp` — soft edge width for the normalized sigma window
 - `token_weight_mode`
   - `none`
   - `linear`
   - `exponential`
 - `token_tail` — final-token weight for non-`none` token weighting
 - `apply_single_stream` — whether selected single-stream blocks should also be patched
+- `cond_only` — only modulate conditional rows when ComfyUI exposes `cond_or_uncond`; default `True`
 
 ### Outputs
 
@@ -218,37 +223,57 @@ The paper’s sparse preset is authored for a canonical FLUX.1 block layout:
 - **38 single blocks**
 - paper combined indices: **`1, 15, 36, 41, 48`**
 
-This repository automatically remaps those 1-based combined indices to the currently loaded Flux-family model.
+This repository can remap those 1-based combined indices to the currently loaded Flux-family model.
 
-For a canonical 57-block layout, the paper indices resolve to:
+For a canonical 57-block layout, the full paper indices resolve to:
 
 - double blocks: `0, 14`
 - single blocks: `16, 21, 28`
 
-However, **single-stream patching is disabled by default** in this node. So with the default settings, the practical effect of the paper preset is:
+For Flux.2-like reduced layouts, the remapping is a heuristic. The safer default preset is therefore:
 
-- patch the remapped **double-stream** subset first
-- leave remapped single-stream blocks inactive unless `apply_single_stream = True`
+```text
+paper_sparse_flux_double_only_safe
+```
 
-That default was chosen because double-stream patching is the safer first approximation, while single-stream behavior is more architecture-sensitive.
+That preset remaps and activates only the paper-derived **double-stream** subset. It avoids implying that the full FLUX.1 sparse block set is known-valid for every Flux-family layout.
+
+Use this only when deliberately testing the full remapped sparse set:
+
+```text
+paper_sparse_flux_full
+```
+
+Even with the full preset, single-stream blocks are still only patched when `apply_single_stream = True`.
+
+Legacy workflows that still contain `paper_sparse_flux` are accepted as an alias for the full remap path, but new workflows should use the explicit preset names.
 
 ### Recommended starting settings
 
-Closest to the appendix sparse-enhancement direction:
+Safest starting point for Flux-family / Flux.2 experiments:
 
-- `block_preset = paper_sparse_flux`
+- `block_preset = paper_sparse_flux_double_only_safe`
 - `strength = 0.5`
 - `sigma_start = 0.0`
 - `sigma_end = 1.0`
 - `sigma_ramp = 0.0`
 - `token_weight_mode = none`
+- `cond_only = True`
 - `apply_single_stream = False`
+
+For an early/high-sigma-only taper, use a window such as:
+
+- `sigma_start = 0.55`
+- `sigma_end = 1.0`
+- `sigma_ramp = 0.10`
 
 ### Example chain
 
 ```text
-Flux model -> ModelSamplingFlux (optional) -> Flux.2 Diff-Aid Sparse Patch -> sampler
+Flux model -> ModelSamplingFlux (optional) -> Flux-family Diff-Aid Sparse Patch -> sampler
 ```
+
+Place this node after model-loader/model-sampling patches and before the sampler. Avoid stacking several nodes that install `model_function_wrapper` unless that combination has been tested.
 
 ---
 
@@ -289,6 +314,7 @@ The patch can be applied:
   - `linear`
   - `exponential`
 - `token_tail`
+- `cond_only`
 
 ### Outputs
 
@@ -316,6 +342,7 @@ Start conservatively because this is an out-of-paper port:
 - `strength = 0.20` to `0.35`
 - `token_weight_mode = linear`
 - `token_tail = 0.35`
+- `cond_only = True`
 - full sigma window
 
 ### Example chain
@@ -331,15 +358,25 @@ SDXL model -> SDXL Diff-Aid Cross-Attention Patch -> sampler
 Both nodes use the same runtime modulation family:
 
 ```text
-α = strength × time_gain × token_gain
+α = strength × time_gain × branch_gain × token_gain
 c' = c + c * α
 ```
 
 where:
 
-- `time_gain` comes from the normalized sigma/timestep window
+- `time_gain` comes from the normalized sigma-level window
+- `branch_gain` is `1` for conditional rows and `0` for unconditional rows when `cond_only = True` and ComfyUI exposes an unambiguous `cond_or_uncond` layout
 - `token_gain` comes from the selected token weighting mode
 - the resulting `α` is broadcast over token embeddings
+
+### Normalized sigma window
+
+The normalized sigma level is derived from the model-call timestep/sigma sequence seen by the wrapper during the current sampling run:
+
+- `1.0` means the first/high-noise call in the current run
+- `0.0` means the low-noise end
+
+This avoids comparing raw ComfyUI timestep/sigma units against normalized UI controls.
 
 ### Token weighting modes
 
@@ -374,27 +411,31 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 
 ## Limitations
 
-1. **Not a paper-exact reproduction**  
+1. **Not a paper-exact reproduction**
    The paper trains lightweight Aid modules; this repo uses hand-constructed runtime modulation.
 
-2. **No trained Aid weights included**  
+2. **No trained Aid weights included**
    There is no shipped checkpoint corresponding to the paper.
 
-3. **FLUX approximation is closer than SDXL**  
+3. **FLUX approximation is closer than SDXL**
    The Flux sparse patch is directly motivated by the paper’s appendix sparse-enhancement result. The SDXL node is a best-effort architectural port.
 
-4. **Single-stream Flux behavior is more sensitive**  
+4. **Single-stream Flux behavior is more sensitive**
    That is why it is disabled by default in the sparse preset path.
 
-5. **Results will be model- and workflow-dependent**  
+5. **Results will be model- and workflow-dependent**
    Especially for non-canonical Flux.2 variants and for SDXL workflows with additional model patches or LoRAs.
+
+6. **The exact minimum supported ComfyUI version has not been pinned**
+   This node pack requires a ComfyUI build with model patch replacement hooks, attention patch hooks, and model function wrappers.
 
 ---
 
 ## Practical guidance
 
-- Start with the **Flux sparse preset** before trying custom indices.
+- Start with the **double-only Flux sparse preset** before trying custom indices.
 - Keep **single-stream patching off** unless you are deliberately testing it.
+- Keep `cond_only = True` unless you intentionally want to modulate unconditional/negative-conditioning rows too.
 - For SDXL, start with **low strength** and broaden only if the effect is too weak.
 - Treat this repo as an **experimental inference-time patch pack**, not as a claim of reproducing the paper’s published numbers.
 
