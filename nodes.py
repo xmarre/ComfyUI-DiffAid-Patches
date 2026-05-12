@@ -603,25 +603,29 @@ class WanBlockReplacePatch(nn.Module):
 
     def forward(self, args: Dict, extra: Dict):
         transformer_options = args.get("transformer_options", {}) or {}
-        txt = args.get("txt", None)
-        if not torch.is_tensor(txt) or txt.ndim < 3 or txt.shape[1] <= 0:
+        key_name = "txt"
+        context = args.get(key_name, None)
+        if not torch.is_tensor(context):
+            key_name = "context"
+            context = args.get(key_name, None)
+        if not torch.is_tensor(context) or context.ndim < 3 or context.shape[1] <= 0:
             return self._call_next(args, extra)
 
-        token_count = int(txt.shape[1])
+        token_count = int(context.shape[1])
         text_start = self._text_start(transformer_options, token_count)
         self._maybe_report_scope(transformer_options, text_start)
         if text_start >= token_count:
             return self._call_next(args, extra)
 
-        text_tokens = txt[:, text_start:, :]
+        text_tokens = context[:, text_start:, :]
         alpha = _compute_alpha(text_tokens, text_tokens.shape[1], self.config, transformer_options)
         text_mod = text_tokens + text_tokens * alpha
 
         new_args = dict(args)
         if text_start == 0:
-            new_args["txt"] = text_mod
+            new_args[key_name] = text_mod
         else:
-            new_args["txt"] = torch.cat((txt[:, :text_start, :], text_mod), dim=1)
+            new_args[key_name] = torch.cat((context[:, :text_start, :], text_mod), dim=1)
         return self._call_next(new_args, extra)
 
 
