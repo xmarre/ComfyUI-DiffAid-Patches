@@ -2,9 +2,10 @@
 
 ComfyUI custom nodes that apply **Diff-Aid-inspired inference-time text-conditioning patches** to supported diffusion models.
 
-This repository is a **practical patch pack for ComfyUI inference**, not a paper-exact reproduction of the original Diff-Aid training method. It currently provides two nodes:
+This repository is a **practical patch pack for ComfyUI inference**, not a paper-exact reproduction of the original Diff-Aid training method. It currently provides three nodes:
 
 - **Flux-family Diff-Aid Sparse Patch** — for Flux-family MMDiT models exposed through ComfyUI as `double_blocks` / `single_blocks`
+- **WAN Diff-Aid Sparse Patch** — for native ComfyUI WAN-family video models exposed as a single `blocks` list, including WAN 2.1 and WAN 2.2 layouts
 - **SDXL Diff-Aid Cross-Attention Patch** — for SDXL-style cross-attention U-Nets, as an architectural adaptation of the same high-level idea
 
 ---
@@ -127,7 +128,7 @@ So the correct description is:
 
 ---
 
-## Why there are two nodes
+## Why there are multiple nodes
 
 The paper works on **rectified text-to-image diffusion transformers** and evaluates **FLUX** and **SD 3.5**.
 
@@ -136,6 +137,14 @@ Those architectures are not interchangeable in ComfyUI integration terms.
 ### Flux-family node
 
 Flux-family models expose transformer block structure that can be patched directly through ComfyUI’s DiT replacement hooks. That makes a sparse block-selection implementation reasonable.
+
+### WAN node
+
+Native ComfyUI WAN-family models do not expose Flux-style `double_blocks` / `single_blocks`. They expose a single transformer `blocks` list and use the same `patches_replace["dit"][("double_block", i)]` replacement convention inside the WAN block loop.
+
+The WAN node uses that native block-replacement path and modulates the WAN context tensor passed to each selected block. For WAN image/video conditioning paths where ComfyUI exposes `clip_fea`, the node records the image-context prefix length at runtime and preserves that prefix by default, so only the remaining context tokens are modulated.
+
+This is **not paper-validated**. The Diff-Aid paper focuses on text-to-image models and explicitly frames text-to-video extension as future work, so the WAN node should be treated as a practical experimental port of the same text-conditioning idea, not as a reproduction of reported paper results.
 
 ### SDXL node
 
@@ -277,7 +286,94 @@ Place this node after model-loader/model-sampling patches and before the sampler
 
 ---
 
-## Node 2: SDXL Diff-Aid Cross-Attention Patch
+## Node 2: WAN Diff-Aid Sparse Patch
+
+**Type:** `MODEL -> MODEL`
+
+This node targets native ComfyUI **WAN-family** video models that expose their transformer stack as a single `blocks` list. It is intended for WAN 2.1 and WAN 2.2 native ComfyUI model objects.
+
+### What it patches
+
+The node installs ComfyUI DiT replacement patches on selected WAN blocks using the `("double_block", index)` replacement key used by the native WAN block loop. At each selected block it modulates the context tensor before the block receives it:
+
+```text
+context' = context + context * α
+```
+
+For text-to-video paths this normally means the text-conditioning context. For image-to-video / TI2V paths with an image-conditioning prefix, `preserve_image_context_prefix = True` keeps the detected image prefix untouched and applies the modulation only to the remaining context tokens. If ComfyUI or another wrapper does not expose a positive prefix length at runtime, the node does not guess one and treats the full context as modulated text context.
+
+### Inputs
+
+- `model` — input `MODEL`
+- `enabled` — bypass switch
+- `block_preset`
+  - `paper_sparse_flux_remapped`
+  - `custom_block_indices`
+- `block_indices` — comma-separated 1-based WAN block indices, used for `custom_block_indices`
+- `strength` — modulation magnitude
+- `sigma_start`, `sigma_end` — normalized sigma-level active window
+- `sigma_ramp` — soft edge width for the normalized sigma window
+- `token_weight_mode`
+  - `none`
+  - `linear`
+  - `exponential`
+- `token_tail` — final-token weight for non-`none` token weighting
+- `preserve_image_context_prefix` — keep detected WAN image-conditioning context tokens unmodified; default `True`
+- `cond_only` — only modulate conditional rows when ComfyUI exposes `cond_or_uncond`; default `True`
+
+### Outputs
+
+- patched `MODEL`
+- summary `STRING`
+
+### Preset behavior
+
+The WAN node has no paper-authored WAN block list. The `paper_sparse_flux_remapped` preset remaps the paper appendix FLUX sparse block list from the canonical 57-block FLUX layout onto the detected WAN `blocks` length. This gives a deterministic sparse starting point for WAN 2.1 / 2.2 experiments without hard-coding one block count.
+
+For example, if the loaded WAN model has 30 blocks, the FLUX sparse list `1,15,36,41,48` remaps to:
+
+```text
+1,8,19,22,25
+```
+
+If the loaded WAN model has 40 blocks, it remaps to:
+
+```text
+1,11,25,29,34
+```
+
+Use `custom_block_indices` when you want exact WAN block indices instead of this remap.
+
+### Recommended starting settings
+
+Conservative WAN starting point:
+
+- `block_preset = paper_sparse_flux_remapped`
+- `strength = 0.35`
+- `sigma_start = 0.0`
+- `sigma_end = 1.0`
+- `sigma_ramp = 0.0`
+- `token_weight_mode = none`
+- `preserve_image_context_prefix = True`
+- `cond_only = True`
+
+For an early/high-sigma-only test, use a window such as:
+
+- `sigma_start = 0.55`
+- `sigma_end = 1.0`
+- `sigma_ramp = 0.10`
+
+### Example chain
+
+```text
+WAN model -> WAN Diff-Aid Sparse Patch -> sampler
+```
+
+Place this node after the WAN model loader and before the sampler. If you also use another WAN patcher that installs block replacement hooks, order can matter. This node preserves an already-installed replacement patch for the same block by calling it after applying the context modulation.
+
+---
+
+## Node 3: SDXL Diff-Aid Cross-Attention Patch
 
 **Type:** `MODEL -> MODEL`
 
@@ -355,7 +451,7 @@ SDXL model -> SDXL Diff-Aid Cross-Attention Patch -> sampler
 
 ## How the modulation works in this repo
 
-Both nodes use the same runtime modulation family:
+All nodes use the same runtime modulation family:
 
 ```text
 α = strength × time_gain × branch_gain × token_gain
@@ -395,6 +491,12 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 - the model is Flux-family
 - the loaded diffusion model exposes `double_blocks` and `single_blocks`
 
+### Use the WAN node when
+
+- the model is a native ComfyUI WAN-family model
+- the located diffusion model exposes `blocks`, `patch_embedding`, `head`, and `forward_orig`
+- the workflow uses WAN 2.1 or WAN 2.2 through ComfyUI’s native WAN path
+
 ### Use the SDXL node when
 
 - the model is an SDXL-style cross-attention U-Net
@@ -403,9 +505,10 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 
 ### Do not expect
 
-- the Flux node to work on SDXL
+- the Flux node to work on SDXL or WAN
+- the WAN node to work on Kijai/WanVideoWrapper internals unless they expose the same native `blocks`/`patches_replace` path
 - the SDXL node to behave like the paper’s SD 3.5 implementation
-- either node to reproduce the paper’s trained Aid results exactly
+- any node to reproduce the paper’s trained Aid results exactly
 
 ---
 
@@ -417,16 +520,19 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 2. **No trained Aid weights included**
    There is no shipped checkpoint corresponding to the paper.
 
-3. **FLUX approximation is closer than SDXL**
-   The Flux sparse patch is directly motivated by the paper’s appendix sparse-enhancement result. The SDXL node is a best-effort architectural port.
+3. **FLUX approximation is closer than WAN or SDXL**
+   The Flux sparse patch is directly motivated by the paper’s appendix sparse-enhancement result. The WAN and SDXL nodes are best-effort architectural ports.
 
-4. **Single-stream Flux behavior is more sensitive**
+4. **WAN is an experimental text-conditioning port**
+   WAN support uses the native WAN block hook where available, but the paper does not evaluate text-to-video models.
+
+5. **Single-stream Flux behavior is more sensitive**
    That is why it is disabled by default in the sparse preset path.
 
-5. **Results will be model- and workflow-dependent**
-   Especially for non-canonical Flux.2 variants and for SDXL workflows with additional model patches or LoRAs.
+6. **Results will be model- and workflow-dependent**
+   Especially for non-canonical Flux.2 variants, WAN 2.1 / 2.2 video workflows, and SDXL workflows with additional model patches or LoRAs.
 
-6. **The exact minimum supported ComfyUI version has not been pinned**
+7. **The exact minimum supported ComfyUI version has not been pinned**
    This node pack requires a ComfyUI build with model patch replacement hooks, attention patch hooks, and model function wrappers.
 
 ---
@@ -436,6 +542,7 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 - Start with the **double-only Flux sparse preset** before trying custom indices.
 - Keep **single-stream patching off** unless you are deliberately testing it.
 - Keep `cond_only = True` unless you intentionally want to modulate unconditional/negative-conditioning rows too.
+- For WAN, start with **moderate strength** and verify motion/detail stability before increasing it.
 - For SDXL, start with **low strength** and broaden only if the effect is too weak.
 - Treat this repo as an **experimental inference-time patch pack**, not as a claim of reproducing the paper’s published numbers.
 
