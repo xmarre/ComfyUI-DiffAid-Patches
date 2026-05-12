@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,7 @@ import torch.nn as nn
 PAPER_SPARSE_FLUX_COMBINED_BLOCKS: Tuple[int, ...] = (1, 15, 36, 41, 48)
 PAPER_SOURCE_FLUX_DOUBLE_BLOCKS = 19
 PAPER_SOURCE_FLUX_SINGLE_BLOCKS = 38
+PAPER_SOURCE_FLUX_TOTAL_BLOCKS = PAPER_SOURCE_FLUX_DOUBLE_BLOCKS + PAPER_SOURCE_FLUX_SINGLE_BLOCKS
 STATE_KEY = "diffaid_runtime_state"
 _EPSILON = 1.0e-12
 
@@ -37,6 +38,14 @@ class FluxMappedBlocks:
     @property
     def total(self) -> int:
         return self.total_double + self.total_single
+
+
+@dataclass(frozen=True)
+class WanMappedBlocks:
+    requested_1based: Tuple[int, ...]
+    mapped_1based: Tuple[int, ...]
+    mapped_0based: Tuple[int, ...]
+    total: int
 
 
 @dataclass(frozen=True)
@@ -157,6 +166,14 @@ def _remap_paper_sparse_flux_indices(total_double: int, total_single: int) -> Li
     return _dedupe_preserve_order([*mapped_double, *mapped_single_combined])
 
 
+def _remap_paper_sparse_flux_to_single_block_list(total_blocks: int) -> List[int]:
+    return _remap_stage_indices(
+        PAPER_SPARSE_FLUX_COMBINED_BLOCKS,
+        PAPER_SOURCE_FLUX_TOTAL_BLOCKS,
+        total_blocks,
+    )
+
+
 def _smoothstep01(x: torch.Tensor) -> torch.Tensor:
     x = x.clamp(0.0, 1.0)
     return x * x * (3.0 - 2.0 * x)
@@ -225,7 +242,14 @@ def _has_tensor_payload(value) -> bool:
 
 
 def _detect_reference_latents(c: Dict, transformer_options: Dict) -> bool:
-    for key in ("reference_latents", "ref_latents", "reference_image", "reference_images"):
+    for key in (
+        "reference_latents",
+        "ref_latents",
+        "reference_latent",
+        "ref_latent",
+        "reference_image",
+        "reference_images",
+    ):
         if _has_tensor_payload(c.get(key)):
             return True
     ref_tokens = transformer_options.get("reference_image_num_tokens", 0)
@@ -233,6 +257,37 @@ def _detect_reference_latents(c: Dict, transformer_options: Dict) -> bool:
         return int(ref_tokens) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _sequence_length(value) -> Optional[int]:
+    if not torch.is_tensor(value):
+        return None
+    # WAN image context features are expected to be batched sequences
+    # such as [batch, tokens, channels]. A 2D tensor is ambiguous because
+    # shape[-2] would usually be the batch dimension, not a token count.
+    if value.ndim < 3:
+        return None
+    try:
+        return int(value.shape[-2])
+    except (TypeError, ValueError):
+        return None
+
+
+def _detect_wan_context_image_tokens(c: Dict, transformer_options: Dict) -> int:
+    for key in ("wan_context_img_len", "context_img_len", "context_image_token_count", "image_context_token_count"):
+        value = transformer_options.get(key, None)
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            return count
+
+    for key in ("clip_fea", "clip_vision_output", "image_embeds"):
+        count = _sequence_length(c.get(key))
+        if count is not None and count > 0:
+            return count
+    return 0
 
 
 def _cond_branch_gain(batch_size: int, config: SharedConfig, transformer_options: Optional[Dict], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -305,9 +360,99 @@ def _is_cross_attn_unet_model(model) -> bool:
     )
 
 
+def _iter_wrapper_children(obj: Any):
+    for attr in ("model", "diffusion_model", "inner_model", "module", "wrapped_model", "_orig_mod"):
+        child = getattr(obj, attr, None)
+        if child is not None and child is not obj:
+            yield attr, child
+
+
+def _looks_like_wan_model(inner: Any) -> bool:
+    return (
+        callable(getattr(inner, "forward_orig", None))
+        and hasattr(inner, "blocks")
+        and hasattr(inner, "patch_embedding")
+        and hasattr(inner, "head")
+        and not hasattr(inner, "double_blocks")
+        and not hasattr(inner, "input_blocks")
+    )
+
+
+def _locate_wan_like_descendant(root: Any, root_name: str) -> Tuple[Optional[Any], Optional[str]]:
+    if root is None:
+        return None, root_name
+
+    queue = [(root, root_name)]
+    seen = set()
+    fallback = None
+    while queue:
+        obj, name = queue.pop(0)
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+
+        if _looks_like_wan_model(obj):
+            return obj, name
+        if fallback is None and callable(getattr(obj, "forward_orig", None)) and hasattr(obj, "blocks"):
+            fallback = (obj, name)
+
+        for attr, child in _iter_wrapper_children(obj):
+            queue.append((child, f"{name}.{attr}"))
+
+    if fallback is not None:
+        return fallback
+    return None, root_name
+
+
+def _locate_wan_inner_model(model) -> Tuple[Optional[Any], Optional[str]]:
+    try:
+        diffusion_model = model.get_model_object("diffusion_model")
+    except Exception:
+        diffusion_model = None
+    if diffusion_model is not None:
+        inner, inner_name = _locate_wan_like_descendant(diffusion_model, "diffusion_model")
+        if inner is not None:
+            return inner, inner_name
+
+    outer = getattr(model, "model", None)
+    if outer is not None and hasattr(outer, "diffusion_model"):
+        return _locate_wan_like_descendant(outer.diffusion_model, "model.diffusion_model")
+    if hasattr(model, "diffusion_model"):
+        return _locate_wan_like_descendant(model.diffusion_model, "diffusion_model")
+    return None, None
+
+
+def _is_wan_family_model(model) -> bool:
+    inner, _inner_name = _locate_wan_inner_model(model)
+    return inner is not None and hasattr(inner, "blocks")
+
+
 def _get_flux_block_counts(model) -> Tuple[int, int]:
     diffusion_model = model.get_model_object("diffusion_model")
     return len(diffusion_model.double_blocks), len(diffusion_model.single_blocks)
+
+
+def _get_wan_block_count(model) -> Tuple[int, Optional[str]]:
+    inner, inner_name = _locate_wan_inner_model(model)
+    if inner is None or not hasattr(inner, "blocks"):
+        raise ValueError("This node expects a WAN-family MODEL whose diffusion model exposes a blocks list.")
+    return len(inner.blocks), inner_name
+
+
+def _map_indices_to_wan_blocks(requested_1based: Sequence[int], total_blocks: int) -> WanMappedBlocks:
+    mapped_0based: List[int] = []
+    for index_1based in requested_1based:
+        if index_1based > total_blocks:
+            raise ValueError(f"WAN block index {index_1based} is outside the model range 1..{total_blocks}.")
+        mapped_0based.append(index_1based - 1)
+    mapped_0based = _dedupe_preserve_order(mapped_0based)
+    return WanMappedBlocks(
+        requested_1based=tuple(_dedupe_preserve_order(requested_1based)),
+        mapped_1based=tuple(index + 1 for index in mapped_0based),
+        mapped_0based=tuple(mapped_0based),
+        total=total_blocks,
+    )
 
 
 def _map_combined_indices_to_flux_stages(indices_1based: Sequence[int], total_double: int, total_single: int) -> FluxMappedBlocks:
@@ -358,6 +503,11 @@ class SharedTimestepWrapper(nn.Module):
         state["raw_timestep"] = timestep
         state["normalized_sigma"] = self._normalized_sigma(timestep, device=device)
         state["reference_latents"] = _detect_reference_latents(c, transformer_options)
+        wan_context_img_len = _detect_wan_context_image_tokens(c, transformer_options)
+        if wan_context_img_len > 0:
+            state["wan_context_img_len"] = wan_context_img_len
+        else:
+            state.pop("wan_context_img_len", None)
         transformer_options[STATE_KEY] = state
         c["transformer_options"] = transformer_options
         return c
@@ -417,6 +567,68 @@ class FluxBlockReplacePatch(nn.Module):
         return self._call_next(new_args, extra)
 
 
+class WanBlockReplacePatch(nn.Module):
+    def __init__(self, config: SharedConfig, preserve_image_context_prefix: bool, existing_patch=None):
+        super().__init__()
+        self.config = config
+        self.preserve_image_context_prefix = bool(preserve_image_context_prefix)
+        self.existing_patch = existing_patch
+        self._reported_reference_latents = False
+        self._reported_image_context = False
+
+    def _call_next(self, args: Dict, extra: Dict):
+        # Diff-Aid mutates the WAN context first, then preserves any patch that already owned this block.
+        if self.existing_patch is not None:
+            return self.existing_patch(args, extra)
+        return extra["original_block"](args)
+
+    def _maybe_report_scope(self, transformer_options: Dict, text_start: int):
+        state = transformer_options.get(STATE_KEY, {}) or {}
+        if state.get("reference_latents", False) and not self._reported_reference_latents:
+            print("[ComfyUI-DiffAid-Patches] WAN reference latents detected; Diff-Aid modulation remains context-token-only.")
+            self._reported_reference_latents = True
+        if text_start > 0 and not self._reported_image_context:
+            print(f"[ComfyUI-DiffAid-Patches] WAN image-context prefix detected; preserving first {text_start} context tokens.")
+            self._reported_image_context = True
+
+    def _text_start(self, transformer_options: Dict, token_count: int) -> int:
+        if not self.preserve_image_context_prefix:
+            return 0
+        state = transformer_options.get(STATE_KEY, {}) or {}
+        try:
+            text_start = int(state.get("wan_context_img_len", 0))
+        except (TypeError, ValueError):
+            text_start = 0
+        return max(0, min(text_start, token_count))
+
+    def forward(self, args: Dict, extra: Dict):
+        transformer_options = args.get("transformer_options", {}) or {}
+        key_name = "txt"
+        context = args.get(key_name, None)
+        if not torch.is_tensor(context):
+            key_name = "context"
+            context = args.get(key_name, None)
+        if not torch.is_tensor(context) or context.ndim < 3 or context.shape[1] <= 0:
+            return self._call_next(args, extra)
+
+        token_count = int(context.shape[1])
+        text_start = self._text_start(transformer_options, token_count)
+        self._maybe_report_scope(transformer_options, text_start)
+        if text_start >= token_count:
+            return self._call_next(args, extra)
+
+        text_tokens = context[:, text_start:, :]
+        alpha = _compute_alpha(text_tokens, text_tokens.shape[1], self.config, transformer_options)
+        text_mod = text_tokens + text_tokens * alpha
+
+        new_args = dict(args)
+        if text_start == 0:
+            new_args[key_name] = text_mod
+        else:
+            new_args[key_name] = torch.cat((context[:, :text_start, :], text_mod), dim=1)
+        return self._call_next(new_args, extra)
+
+
 class SDXLCrossAttentionPatch(nn.Module):
     def __init__(self, config: SharedConfig, stage_filter: str, targets: Tuple[SdxlTargetSpec, ...]):
         super().__init__()
@@ -456,12 +668,17 @@ class SDXLCrossAttentionPatch(nn.Module):
         return n, context_mod, value_mod
 
 
-def _get_existing_flux_replace_patch(model, stage: str, stage_index: int):
+def _get_existing_dit_replace_patch(model, block_kind: str, stage_index: int):
+    # ComfyUI stores Flux and WAN block replacements under the same DiT namespace.
     transformer_options = model.model_options.get("transformer_options", {})
     patches_replace = transformer_options.get("patches_replace", {})
     dit_patches = patches_replace.get("dit", {})
-    key = ("double_block", stage_index) if stage == "double" else ("single_block", stage_index)
-    return dit_patches.get(key)
+    return dit_patches.get((block_kind, stage_index))
+
+
+def _get_existing_flux_replace_patch(model, stage: str, stage_index: int):
+    block_kind = "double_block" if stage == "double" else "single_block"
+    return _get_existing_dit_replace_patch(model, block_kind, stage_index)
 
 
 def _fmt_ints(values: Sequence[int]) -> str:
@@ -577,6 +794,94 @@ class Flux2DiffAidSparsePatchNode:
         return patched, summary
 
 
+class WanDiffAidSparsePatchNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "enabled": ("BOOLEAN", {"default": True}),
+                "block_preset": (
+                    ["paper_sparse_flux_remapped", "custom_block_indices"],
+                    {"default": "paper_sparse_flux_remapped"},
+                ),
+                "block_indices": ("STRING", {"default": "1,15,36,41,48", "multiline": False, "advanced": True}),
+                "strength": ("FLOAT", {"default": 0.35, "min": -1.0, "max": 1.0, "step": 0.01}),
+                "sigma_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "sigma_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "sigma_ramp": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.5, "step": 0.001, "advanced": True}),
+                "token_weight_mode": (["none", "linear", "exponential"], {"default": "none"}),
+                "token_tail": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01, "advanced": True}),
+                "preserve_image_context_prefix": ("BOOLEAN", {"default": True, "advanced": True}),
+                "cond_only": ("BOOLEAN", {"default": True, "advanced": True}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "summary")
+    FUNCTION = "patch"
+    CATEGORY = "model_patches/diffaid"
+
+    def patch(
+        self,
+        model,
+        enabled: bool,
+        block_preset: str,
+        block_indices: str,
+        strength: float,
+        sigma_start: float,
+        sigma_end: float,
+        sigma_ramp: float,
+        token_weight_mode: str,
+        token_tail: float,
+        preserve_image_context_prefix: bool = True,
+        cond_only: bool = True,
+    ):
+        if not enabled:
+            return model, "disabled"
+        if not _is_wan_family_model(model):
+            raise ValueError("This node only supports WAN-family MODEL objects that expose a single blocks list. Use the Flux node for double_blocks/single_blocks models.")
+        if sigma_start > sigma_end:
+            raise ValueError(f"sigma_start ({sigma_start}) must be <= sigma_end ({sigma_end}).")
+
+        total_blocks, inner_name = _get_wan_block_count(model)
+        if block_preset == "paper_sparse_flux_remapped":
+            requested_indices = list(PAPER_SPARSE_FLUX_COMBINED_BLOCKS)
+            mapped_indices = _remap_paper_sparse_flux_to_single_block_list(total_blocks)
+            preset_name = f"paper_sparse_flux_remapped_from_flux1(source_total={PAPER_SOURCE_FLUX_TOTAL_BLOCKS})"
+        else:
+            requested_indices = _parse_combined_block_indices(block_indices)
+            mapped_indices = requested_indices
+            preset_name = "custom_block_indices"
+
+        mapped = _map_indices_to_wan_blocks(mapped_indices, total_blocks)
+        config = SharedConfig(float(strength), float(sigma_start), float(sigma_end), float(sigma_ramp), token_weight_mode, float(token_tail), bool(cond_only))
+
+        patched = model.clone()
+        existing_model_wrapper = patched.model_options.get("model_function_wrapper")
+        patched.set_model_unet_function_wrapper(SharedTimestepWrapper(existing_wrapper=existing_model_wrapper))
+
+        for block_index in mapped.mapped_0based:
+            existing_patch = _get_existing_dit_replace_patch(patched, "double_block", block_index)
+            patched.set_model_patch_replace(
+                WanBlockReplacePatch(config, preserve_image_context_prefix=preserve_image_context_prefix, existing_patch=existing_patch),
+                "dit",
+                "double_block",
+                block_index,
+            )
+
+        summary = (
+            f"wan_sparse preset={preset_name}; requested_blocks=[{_fmt_ints(requested_indices)}]; "
+            f"mapped_blocks=[{_fmt_ints(mapped.mapped_1based)}]; blocks_0based=[{_fmt_ints(mapped.mapped_0based)}]; "
+            f"cond_only={str(config.cond_only).lower()}; preserve_image_context_prefix={str(bool(preserve_image_context_prefix)).lower()}; "
+            f"strength={config.strength:.3f}; normalized_sigma_window=[{config.sigma_start:.3f}, {config.sigma_end:.3f}] ramp={config.sigma_ramp:.3f}; "
+            f"token_weight_mode={config.token_weight_mode}; token_tail={config.token_tail:.3f}; reference_latents=runtime_detected_context_only; "
+            f"model_total_blocks={mapped.total}; inner={inner_name or '-'}"
+        )
+        print(f"[ComfyUI-DiffAid-Patches] {summary}")
+        return patched, summary
+
+
 class SDXLDiffAidCrossAttentionPatchNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -640,10 +945,12 @@ class SDXLDiffAidCrossAttentionPatchNode:
 
 NODE_CLASS_MAPPINGS = {
     "Flux2DiffAidSparsePatch": Flux2DiffAidSparsePatchNode,
+    "WanDiffAidSparsePatch": WanDiffAidSparsePatchNode,
     "SDXLDiffAidCrossAttentionPatch": SDXLDiffAidCrossAttentionPatchNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Flux2DiffAidSparsePatch": "Flux-family Diff-Aid Sparse Patch",
+    "WanDiffAidSparsePatch": "WAN Diff-Aid Sparse Patch",
     "SDXLDiffAidCrossAttentionPatch": "SDXL Diff-Aid Cross-Attention Patch",
 }
