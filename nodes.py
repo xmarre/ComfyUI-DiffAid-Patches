@@ -186,9 +186,24 @@ def _sigma_window_gain(normalized_sigma: torch.Tensor, start: float, end: float,
     if ramp <= 0.0:
         return ((normalized_sigma >= start) & (normalized_sigma <= end)).to(dtype=normalized_sigma.dtype)
 
+    # Keep sigma_start/sigma_end as the full-strength window boundaries.
+    # Ramp only softens the shoulders outside that window, so a boundary that
+    # touches 0.0 or 1.0 is not accidentally reduced to half strength.
     ramp = max(float(ramp), _EPSILON)
-    left = _smoothstep01((normalized_sigma - (start - ramp)) / (2.0 * ramp))
-    right = 1.0 - _smoothstep01((normalized_sigma - (end - ramp)) / (2.0 * ramp))
+    if start <= 0.0:
+        left = torch.ones_like(normalized_sigma)
+    else:
+        left_edge = max(0.0, start - ramp)
+        left_width = max(start - left_edge, _EPSILON)
+        left = _smoothstep01((normalized_sigma - left_edge) / left_width)
+
+    if end >= 1.0:
+        right = torch.ones_like(normalized_sigma)
+    else:
+        right_edge = min(1.0, end + ramp)
+        right_width = max(right_edge - end, _EPSILON)
+        right = 1.0 - _smoothstep01((normalized_sigma - end) / right_width)
+
     return (left * right).clamp(0.0, 1.0)
 
 
@@ -229,6 +244,16 @@ def _as_float_tensor(value, device: torch.device) -> Optional[torch.Tensor]:
         return torch.tensor([float(value)], device=device, dtype=torch.float32)
     except (TypeError, ValueError):
         return None
+
+
+def _max_abs_positive(value, device: torch.device) -> Optional[float]:
+    t = _as_float_tensor(value, device=device)
+    if t is None or t.numel() == 0:
+        return None
+    sigma_abs = float(t.abs().max().item())
+    if sigma_abs <= _EPSILON:
+        return None
+    return sigma_abs
 
 
 def _has_tensor_payload(value) -> bool:
@@ -482,10 +507,32 @@ class SharedTimestepWrapper(nn.Module):
         self._first_sigma_abs: Optional[float] = None
         self._last_sigma_abs: Optional[float] = None
 
-    def _normalized_sigma(self, timestep, device: torch.device) -> torch.Tensor:
+    def _reset_sigma_state(self):
+        self._first_sigma_abs = None
+        self._last_sigma_abs = None
+
+    def cleanup(self, **kwargs):
+        self._reset_sigma_state()
+        cleanup = getattr(self.existing_wrapper, "cleanup", None)
+        if callable(cleanup):
+            return cleanup(**kwargs)
+        return None
+
+    def _normalized_sigma(self, timestep, device: torch.device, transformer_options: Optional[Dict] = None) -> torch.Tensor:
         t = _as_float_tensor(timestep, device=device)
         if t is None or t.numel() == 0:
             return torch.tensor([1.0], device=device, dtype=torch.float32)
+
+        transformer_options = transformer_options or {}
+        scheduled_first_sigma = _max_abs_positive(transformer_options.get("sample_sigmas", None), device=device)
+        if scheduled_first_sigma is not None:
+            # Prefer the current sampler's sigma schedule over wrapper-local
+            # state. This makes interrupted/restarted runs independent even
+            # when the next run begins at a lower sigma than the interrupted one.
+            self._first_sigma_abs = scheduled_first_sigma
+            self._last_sigma_abs = float(t.abs().max().item())
+            return (t.abs() / scheduled_first_sigma).clamp(0.0, 1.0)
+
         current = float(t.abs().max().item())
         reset_threshold = max(abs(self._last_sigma_abs or 0.0), 1.0) * 1.0e-4
         if self._first_sigma_abs is None or (self._last_sigma_abs is not None and current > self._last_sigma_abs + reset_threshold):
@@ -501,7 +548,7 @@ class SharedTimestepWrapper(nn.Module):
         state = dict(transformer_options.get(STATE_KEY, {}))
         device = timestep.device if torch.is_tensor(timestep) else torch.device("cpu")
         state["raw_timestep"] = timestep
-        state["normalized_sigma"] = self._normalized_sigma(timestep, device=device)
+        state["normalized_sigma"] = self._normalized_sigma(timestep, device=device, transformer_options=transformer_options)
         state["reference_latents"] = _detect_reference_latents(c, transformer_options)
         wan_context_img_len = _detect_wan_context_image_tokens(c, transformer_options)
         if wan_context_img_len > 0:
