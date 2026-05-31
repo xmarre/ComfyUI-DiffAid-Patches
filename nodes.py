@@ -756,7 +756,10 @@ def _cache_float(value: Any, default: float = 0.0) -> float:
 
 
 def _cache_str(value: Any) -> str:
-    return "" if value is None else str(value)
+    if value is None:
+        return ""
+    normalized = re.sub(r"\s+", " ", str(value)).strip()
+    return normalized.lower()
 
 
 def _shared_config_fingerprint(
@@ -827,10 +830,11 @@ class Flux2DiffAidSparsePatchNode:
         apply_single_stream: bool = False,
         cond_only: bool = True,
     ):
+        use_custom_indices = _cache_str(block_preset) == "custom_combined_indices"
         return (
             "flux_sparse",
             _cache_str(block_preset),
-            _cache_str(block_indices),
+            _cache_str(block_indices) if use_custom_indices else "",
             _cache_bool(apply_single_stream),
             *_shared_config_fingerprint(
                 enabled=enabled,
@@ -956,10 +960,11 @@ class WanDiffAidSparsePatchNode:
         preserve_image_context_prefix: bool = True,
         cond_only: bool = True,
     ):
+        use_custom_indices = _cache_str(block_preset) == "custom_block_indices"
         return (
             "wan_sparse",
             _cache_str(block_preset),
-            _cache_str(block_indices),
+            _cache_str(block_indices) if use_custom_indices else "",
             _cache_bool(preserve_image_context_prefix),
             *_shared_config_fingerprint(
                 enabled=enabled,
@@ -1071,9 +1076,10 @@ class SDXLDiffAidCrossAttentionPatchNode:
         token_tail: float = 0.35,
         cond_only: bool = True,
     ):
+        has_targets = bool(_cache_str(block_targets))
         return (
             "sdxl_cross_attention",
-            _cache_str(stage_filter),
+            _cache_str(stage_filter) if not has_targets else "",
             _cache_str(block_targets),
             *_shared_config_fingerprint(
                 enabled=enabled,
