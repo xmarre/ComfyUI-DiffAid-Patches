@@ -744,6 +744,46 @@ def _fmt_targets(values: Sequence[SdxlTargetSpec]) -> str:
     return ", ".join(out)
 
 
+def _cache_bool(value: Any) -> bool:
+    return bool(value)
+
+
+def _cache_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return round(float(value), 8)
+    except (TypeError, ValueError):
+        return default
+
+
+def _cache_str(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _shared_config_fingerprint(
+    *,
+    enabled: bool,
+    strength: float,
+    sigma_start: float,
+    sigma_end: float,
+    sigma_ramp: float,
+    token_weight_mode: str,
+    token_tail: float,
+    cond_only: bool,
+) -> Tuple[Any, ...]:
+    if not _cache_bool(enabled):
+        return ("disabled",)
+    return (
+        "enabled",
+        _cache_float(strength),
+        _cache_float(sigma_start),
+        _cache_float(sigma_end),
+        _cache_float(sigma_ramp),
+        _cache_str(token_weight_mode),
+        _cache_float(token_tail),
+        _cache_bool(cond_only),
+    )
+
+
 class Flux2DiffAidSparsePatchNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -771,6 +811,38 @@ class Flux2DiffAidSparsePatchNode:
     RETURN_NAMES = ("model", "summary")
     FUNCTION = "patch"
     CATEGORY = "model_patches/diffaid"
+
+    @staticmethod
+    def IS_CHANGED(
+        model=None,
+        enabled: bool = True,
+        block_preset: str = "paper_sparse_flux_double_only_safe",
+        block_indices: str = "1,15,36,41,48",
+        strength: float = 0.5,
+        sigma_start: float = 0.0,
+        sigma_end: float = 1.0,
+        sigma_ramp: float = 0.0,
+        token_weight_mode: str = "none",
+        token_tail: float = 0.35,
+        apply_single_stream: bool = False,
+        cond_only: bool = True,
+    ):
+        return (
+            "flux_sparse",
+            _cache_str(block_preset),
+            _cache_str(block_indices),
+            _cache_bool(apply_single_stream),
+            *_shared_config_fingerprint(
+                enabled=enabled,
+                strength=strength,
+                sigma_start=sigma_start,
+                sigma_end=sigma_end,
+                sigma_ramp=sigma_ramp,
+                token_weight_mode=token_weight_mode,
+                token_tail=token_tail,
+                cond_only=cond_only,
+            ),
+        )
 
     def patch(
         self,
@@ -869,6 +941,38 @@ class WanDiffAidSparsePatchNode:
     FUNCTION = "patch"
     CATEGORY = "model_patches/diffaid"
 
+    @staticmethod
+    def IS_CHANGED(
+        model=None,
+        enabled: bool = True,
+        block_preset: str = "paper_sparse_flux_remapped",
+        block_indices: str = "1,15,36,41,48",
+        strength: float = 0.35,
+        sigma_start: float = 0.0,
+        sigma_end: float = 1.0,
+        sigma_ramp: float = 0.0,
+        token_weight_mode: str = "none",
+        token_tail: float = 0.35,
+        preserve_image_context_prefix: bool = True,
+        cond_only: bool = True,
+    ):
+        return (
+            "wan_sparse",
+            _cache_str(block_preset),
+            _cache_str(block_indices),
+            _cache_bool(preserve_image_context_prefix),
+            *_shared_config_fingerprint(
+                enabled=enabled,
+                strength=strength,
+                sigma_start=sigma_start,
+                sigma_end=sigma_end,
+                sigma_ramp=sigma_ramp,
+                token_weight_mode=token_weight_mode,
+                token_tail=token_tail,
+                cond_only=cond_only,
+            ),
+        )
+
     def patch(
         self,
         model,
@@ -952,6 +1056,36 @@ class SDXLDiffAidCrossAttentionPatchNode:
     RETURN_NAMES = ("model", "summary")
     FUNCTION = "patch"
     CATEGORY = "model_patches/diffaid"
+
+    @staticmethod
+    def IS_CHANGED(
+        model=None,
+        enabled: bool = True,
+        stage_filter: str = "all",
+        block_targets: str = "",
+        strength: float = 0.35,
+        sigma_start: float = 0.0,
+        sigma_end: float = 1.0,
+        sigma_ramp: float = 0.0,
+        token_weight_mode: str = "linear",
+        token_tail: float = 0.35,
+        cond_only: bool = True,
+    ):
+        return (
+            "sdxl_cross_attention",
+            _cache_str(stage_filter),
+            _cache_str(block_targets),
+            *_shared_config_fingerprint(
+                enabled=enabled,
+                strength=strength,
+                sigma_start=sigma_start,
+                sigma_end=sigma_end,
+                sigma_ramp=sigma_ramp,
+                token_weight_mode=token_weight_mode,
+                token_tail=token_tail,
+                cond_only=cond_only,
+            ),
+        )
 
     def patch(
         self,
