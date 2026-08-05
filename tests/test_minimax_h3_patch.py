@@ -266,6 +266,11 @@ def test_patch_does_not_mutate_args_tensor_or_unrelated_values():
         ([(0, 15, 1)], "outside packed row range"),
         ([(0, 3, 1), (2, 4, 0)], "overlaps or descends"),
         ([(3, 4, 1), (1, 2, 0)], "overlaps or descends"),
+        ("0,1,1", "must be a sequence"),
+        (b"0,1,1", "must be a sequence"),
+        (object(), "must be an indexable sequence"),
+        (["012"], "not a valid segment tuple"),
+        ([b"012"], "not a valid segment tuple"),
     ],
 )
 def test_metadata_failures_are_descriptive(segments, match):
@@ -324,7 +329,9 @@ def test_node_clones_once_preserves_original_options_and_composes_hooks():
         wrapper_calls.append(params)
         return model_function(params["input"], params["timestep"], **params["c"])
 
-    existing_block = lambda args, extra: extra["original_block"](args)
+    def existing_block(args, extra):
+        return extra["original_block"](args)
+
     model_options = {
         "model_function_wrapper": existing_wrapper,
         "transformer_options": {"patches_replace": {"dit": {("double_block", 49): existing_block}}},
