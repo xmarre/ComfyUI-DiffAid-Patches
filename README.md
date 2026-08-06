@@ -2,10 +2,11 @@
 
 ComfyUI custom nodes that apply **Diff-Aid-inspired inference-time text-conditioning patches** to supported diffusion models.
 
-This repository is a **practical patch pack for ComfyUI inference**, not a paper-exact reproduction of the original Diff-Aid training method. It currently provides three nodes:
+This repository is a **practical patch pack for ComfyUI inference**, not a paper-exact reproduction of the original Diff-Aid training method. It currently provides four nodes:
 
 - **Flux-family Diff-Aid Sparse Patch** — for Flux-family MMDiT models exposed through ComfyUI as `double_blocks` / `single_blocks`
 - **WAN Diff-Aid Sparse Patch** — for native ComfyUI WAN-family video models exposed as a single `blocks` list, including WAN 2.1 and WAN 2.2 layouts
+- **MiniMax H3 Diff-Aid Sparse Patch** — for native ComfyUI MiniMax H3 models with packed text, visual, audio, and video rows
 - **SDXL Diff-Aid Cross-Attention Patch** — for SDXL-style cross-attention U-Nets, as an architectural adaptation of the same high-level idea
 
 ---
@@ -124,7 +125,7 @@ In this codebase:
 So the correct description is:
 
 - **paper**: trained adaptive block/timestep/token modulation
-- **this repo**: practical inference-time modulation patch inspired by that idea, with a closer approximation for FLUX sparse enhancement and a best-effort SDXL port
+- **this repo**: practical inference-time modulation inspired by that idea, with a closer approximation for FLUX sparse enhancement and experimental architecture-specific ports for MiniMax H3, WAN, and SDXL
 
 ---
 
@@ -146,6 +147,14 @@ The WAN node uses that native block-replacement path and modulates the WAN conte
 
 This is **not paper-validated**. The Diff-Aid paper focuses on text-to-image models and explicitly frames text-to-video extension as future work, so the WAN node should be treated as a practical experimental port of the same text-conditioning idea, not as a reproduction of reported paper results.
 
+### MiniMax H3 node
+
+Native ComfyUI MiniMax H3 uses one two-dimensional packed hidden tensor shaped `[packed_sequence_rows, hidden_size]`. Depending on the workflow, that sequence can contain Qwen presentation rows, vision pads, visual conditions, reference image/video rows, reference audio rows, target audio rows, and target video rows.
+
+The native model passes `mod_segments` entries shaped `(start_row, stop_row, modulation_index)` into each transformer block. The modality class is `modulation_index % 3`: class `1` is genuine language, class `0` is visual, and class `2` is audio. The H3 node treats this metadata as authoritative and modulates only class-1 ranges. It preserves vision pads even when they interrupt the initial text presentation span, along with every visual condition, reference, audio, and target-video row.
+
+This H3 adaptation is experimental. It has no trained Aid module and no H3-specific validation in the Diff-Aid paper. Its block selection and strength require empirical testing.
+
 ### SDXL node
 
 SDXL is a **cross-attention U-Net**, not a Flux-style MMDiT with `double_blocks` and `single_blocks`. So the correct hook point is the UNet cross-attention path rather than Flux block replacement.
@@ -161,6 +170,7 @@ ComfyUI-DiffAid-Patches/
 ├── __init__.py
 ├── nodes.py
 ├── README.md
+├── tests/
 ├── requirements.txt
 └── LICENSE
 ```
@@ -373,7 +383,84 @@ Place this node after the WAN model loader and before the sampler. If you also u
 
 ---
 
-## Node 3: SDXL Diff-Aid Cross-Attention Patch
+## Node 3: MiniMax H3 Diff-Aid Sparse Patch
+
+**Type:** `MODEL -> MODEL, STRING`
+
+This node targets the native ComfyUI MiniMax H3 implementation. It installs replacements on selected entries in the model's single transformer `blocks` list and applies:
+
+```text
+text_rows' = text_rows + text_rows * α
+```
+
+Only ranges identified by native `mod_segments` metadata as modality class `1` are eligible. Token weighting advances continuously over those genuine language rows, so intervening vision pads do not consume token-weight positions. Missing or malformed metadata is treated as a compatibility error; the node does not guess a text prefix.
+
+### Inputs
+
+- `model` — native MiniMax H3 `MODEL`
+- `enabled` — bypass switch; a disabled node returns the original model without cloning
+- `block_indices` — comma-separated 1-based H3 transformer block indices
+- `strength` — modulation magnitude in `[-1.0, 1.0]`
+- `sigma_start`, `sigma_end` — normalized sigma-level active window
+- `sigma_ramp` — soft shoulder width outside that window
+- `token_weight_mode`
+  - `none`
+  - `linear`
+  - `exponential`
+- `token_tail` — final linguistic-row weight for non-`none` token weighting
+- `cond_only` — modulate only conditional rows when ComfyUI exposes `cond_or_uncond`; default `True`
+
+### Outputs
+
+- patched `MODEL`
+- diagnostic summary `STRING`
+
+### Experimental starting settings
+
+- `block_indices = "1,13,25,37,50"`
+- `strength = 0.20`
+- `sigma_start = 0.0`
+- `sigma_end = 1.0`
+- `sigma_ramp = 0.0`
+- `token_weight_mode = none`
+- `token_tail = 0.35`
+- `cond_only = True`
+
+The current default is an evenly distributed exploratory starting set for the current 50-block native model. It is not derived from the paper's FLUX indices, is not a quality preset, and is validated against the detected model's actual block count at runtime. Benchmark other block groups and strength values before drawing conclusions.
+
+### Spectrum-compatible workflow order
+
+```text
+Load Diffusion Model
+-> MiniMax H3 Diff-Aid Sparse Patch
+-> Spectrum Apply MiniMax H3
+-> guider / scheduler
+```
+
+The block-replacement chain is preserved when both nodes select the same block, including the final H3 block used by Spectrum for actual-step feature capture. Diff-Aid therefore affects actual transformer evaluations and the history Spectrum fits. Spectrum forecast steps skip transformer execution by design.
+
+### H3 validation matrix
+
+Use fixed generation settings and compare all four cases:
+
+| Case | Diff-Aid H3 | Spectrum H3 |
+|---|---:|---:|
+| Native baseline | Off | Off |
+| Diff-Aid H3 only | On | Off |
+| Spectrum H3 only | Off | On |
+| Combined | On | On |
+
+Test each relevant generation mode separately:
+
+- T2VA
+- image-to-video or keyframe-conditioned generation
+- Ref2VA
+
+Hold the seed, prompt, model, resolution or MP setting, duration, sampler, step count, and all conditioning inputs fixed. Check prompt adherence, subject and scene stability, motion, visual artifacts, audio intelligibility, audio artifacts, lip synchronization, general audio-video synchronization, runtime, and peak VRAM.
+
+---
+
+## Node 4: SDXL Diff-Aid Cross-Attention Patch
 
 **Type:** `MODEL -> MODEL`
 
@@ -497,6 +584,12 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 - the located diffusion model exposes `blocks`, `patch_embedding`, `head`, and `forward_orig`
 - the workflow uses WAN 2.1 or WAN 2.2 through ComfyUI’s native WAN path
 
+### Use the MiniMax H3 node when
+
+- the model uses ComfyUI's native MiniMax H3 diffusion path
+- the detected inner model exposes the H3 packed-sequence projections, token refiner, final layer, sigma shifts, and single `blocks` list
+- text scope must follow native `mod_segments` class-1 ranges
+
 ### Use the SDXL node when
 
 - the model is an SDXL-style cross-attention U-Net
@@ -507,6 +600,7 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 
 - the Flux node to work on SDXL or WAN
 - the WAN node to work on Kijai/WanVideoWrapper internals unless they expose the same native `blocks`/`patches_replace` path
+- the MiniMax H3 node to reproduce trained Diff-Aid or paper-validated H3 results
 - the SDXL node to behave like the paper’s SD 3.5 implementation
 - any node to reproduce the paper’s trained Aid results exactly
 
@@ -520,19 +614,22 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 2. **No trained Aid weights included**
    There is no shipped checkpoint corresponding to the paper.
 
-3. **FLUX approximation is closer than WAN or SDXL**
-   The Flux sparse patch is directly motivated by the paper’s appendix sparse-enhancement result. The WAN and SDXL nodes are best-effort architectural ports.
+3. **FLUX approximation is closer than MiniMax H3, WAN, or SDXL**
+   The Flux sparse patch is directly motivated by the paper’s appendix sparse-enhancement result. The MiniMax H3, WAN, and SDXL nodes are experimental architectural ports.
 
 4. **WAN is an experimental text-conditioning port**
    WAN support uses the native WAN block hook where available, but the paper does not evaluate text-to-video models.
 
-5. **Single-stream Flux behavior is more sensitive**
+5. **MiniMax H3 placement is unvalidated**
+   The default H3 block list is exploratory. There are no H3 ablations establishing useful blocks, strengths, or sigma windows.
+
+6. **Single-stream Flux behavior is more sensitive**
    That is why it is disabled by default in the sparse preset path.
 
-6. **Results will be model- and workflow-dependent**
-   Especially for non-canonical Flux.2 variants, WAN 2.1 / 2.2 video workflows, and SDXL workflows with additional model patches or LoRAs.
+7. **Results will be model- and workflow-dependent**
+   Especially for non-canonical Flux.2 variants, MiniMax H3 audio-video modes, WAN 2.1 / 2.2 video workflows, and SDXL workflows with additional model patches or LoRAs.
 
-7. **The exact minimum supported ComfyUI version has not been pinned**
+8. **The exact minimum supported ComfyUI version has not been pinned**
    This node pack requires a ComfyUI build with model patch replacement hooks, attention patch hooks, and model function wrappers.
 
 ---
@@ -542,6 +639,7 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 - Start with the **double-only Flux sparse preset** before trying custom indices.
 - Keep **single-stream patching off** unless you are deliberately testing it.
 - Keep `cond_only = True` unless you intentionally want to modulate unconditional/negative-conditioning rows too.
+- For MiniMax H3, start with low strength and compare the full validation matrix with fixed generation settings.
 - For WAN, start with **moderate strength** and verify motion/detail stability before increasing it.
 - For SDXL, start with **low strength** and broaden only if the effect is too weak.
 - Treat this repo as an **experimental inference-time patch pack**, not as a claim of reproducing the paper’s published numbers.

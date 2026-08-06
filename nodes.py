@@ -49,6 +49,13 @@ class WanMappedBlocks:
 
 
 @dataclass(frozen=True)
+class MiniMaxH3MappedBlocks:
+    requested_1based: Tuple[int, ...]
+    mapped_0based: Tuple[int, ...]
+    total: int
+
+
+@dataclass(frozen=True)
 class SdxlTargetSpec:
     stage: str
     block_number: int
@@ -453,6 +460,84 @@ def _is_wan_family_model(model) -> bool:
     return inner is not None and hasattr(inner, "blocks")
 
 
+def _looks_like_minimax_h3_model(inner: Any) -> bool:
+    if inner is None:
+        return False
+    if any(hasattr(inner, attr) for attr in ("double_blocks", "single_blocks", "input_blocks", "middle_block", "output_blocks")):
+        return False
+    if _looks_like_wan_model(inner):
+        return False
+    required_attrs = (
+        "blocks",
+        "video_patch_proj",
+        "audio_patch_proj",
+        "condition_proj",
+        "final_layer",
+        "token_refiner",
+        "sigma_shift_video",
+        "sigma_shift_audio",
+    )
+    return callable(getattr(inner, "_forward", None)) and all(hasattr(inner, attr) for attr in required_attrs)
+
+
+def _locate_minimax_h3_descendant(root: Any, root_name: str) -> Tuple[Optional[Any], Optional[str]]:
+    if root is None:
+        return None, None
+
+    queue = [(root, root_name)]
+    seen = set()
+    while queue:
+        obj, name = queue.pop(0)
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+
+        if _looks_like_minimax_h3_model(obj):
+            return obj, name
+        for attr, child in _iter_wrapper_children(obj):
+            queue.append((child, f"{name}.{attr}"))
+    return None, None
+
+
+def _locate_minimax_h3_inner_model(model) -> Tuple[Optional[Any], Optional[str]]:
+    try:
+        diffusion_model = model.get_model_object("diffusion_model")
+    except Exception:
+        diffusion_model = None
+    if diffusion_model is not None:
+        inner, inner_name = _locate_minimax_h3_descendant(diffusion_model, "diffusion_model")
+        if inner is not None:
+            return inner, inner_name
+
+    outer = getattr(model, "model", None)
+    if outer is not None and hasattr(outer, "diffusion_model"):
+        inner, inner_name = _locate_minimax_h3_descendant(outer.diffusion_model, "model.diffusion_model")
+        if inner is not None:
+            return inner, inner_name
+    if hasattr(model, "diffusion_model"):
+        return _locate_minimax_h3_descendant(model.diffusion_model, "diffusion_model")
+    return None, None
+
+
+def _is_minimax_h3_model(model) -> bool:
+    inner, _inner_name = _locate_minimax_h3_inner_model(model)
+    return inner is not None
+
+
+def _get_minimax_h3_block_count(model) -> Tuple[int, Optional[str]]:
+    inner, inner_name = _locate_minimax_h3_inner_model(model)
+    if inner is None:
+        raise ValueError("This node expects a native ComfyUI MiniMax H3 MODEL with the packed-sequence transformer structure.")
+    try:
+        total = len(inner.blocks)
+    except (TypeError, AttributeError) as exc:
+        raise ValueError("The detected native MiniMax H3 model does not expose a valid blocks list.") from exc
+    if total <= 0:
+        raise ValueError("The detected native MiniMax H3 model has no transformer blocks.")
+    return total, inner_name
+
+
 def _get_flux_block_counts(model) -> Tuple[int, int]:
     diffusion_model = model.get_model_object("diffusion_model")
     return len(diffusion_model.double_blocks), len(diffusion_model.single_blocks)
@@ -476,6 +561,19 @@ def _map_indices_to_wan_blocks(requested_1based: Sequence[int], total_blocks: in
         requested_1based=tuple(_dedupe_preserve_order(requested_1based)),
         mapped_1based=tuple(index + 1 for index in mapped_0based),
         mapped_0based=tuple(mapped_0based),
+        total=total_blocks,
+    )
+
+
+def _map_indices_to_minimax_h3_blocks(requested_1based: Sequence[int], total_blocks: int) -> MiniMaxH3MappedBlocks:
+    mapped_0based: List[int] = []
+    for index_1based in requested_1based:
+        if index_1based > total_blocks:
+            raise ValueError(f"MiniMax H3 block index {index_1based} is outside the model range 1..{total_blocks}.")
+        mapped_0based.append(index_1based - 1)
+    return MiniMaxH3MappedBlocks(
+        requested_1based=tuple(_dedupe_preserve_order(requested_1based)),
+        mapped_0based=tuple(_dedupe_preserve_order(mapped_0based)),
         total=total_blocks,
     )
 
@@ -676,6 +774,104 @@ class WanBlockReplacePatch(nn.Module):
         return self._call_next(new_args, extra)
 
 
+def _minimax_h3_language_ranges(mod_segments: Any, row_count: int) -> Tuple[Tuple[int, int], ...]:
+    if mod_segments is None:
+        raise RuntimeError(
+            "Native MiniMax H3 block arguments are missing 'mod_segments'; "
+            "this ComfyUI build is incompatible with tag-1-only Diff-Aid text scoping."
+        )
+    if isinstance(mod_segments, (str, bytes)):
+        raise RuntimeError("Native MiniMax H3 'mod_segments' must be a sequence of (start, stop, modulation_index) entries.")
+    try:
+        segment_count = len(mod_segments)
+    except TypeError as exc:
+        raise RuntimeError("Native MiniMax H3 'mod_segments' must be an indexable sequence.") from exc
+
+    language_ranges: List[Tuple[int, int]] = []
+    previous_stop = 0
+    for position in range(segment_count):
+        try:
+            segment = mod_segments[position]
+        except (KeyError, TypeError, IndexError) as exc:
+            raise RuntimeError("Native MiniMax H3 'mod_segments' must be an indexable sequence.") from exc
+        if isinstance(segment, (str, bytes)):
+            raise RuntimeError(f"Native MiniMax H3 mod_segments[{position}] is not a valid segment tuple.")
+        try:
+            segment_length = len(segment)
+        except TypeError as exc:
+            raise RuntimeError(f"Native MiniMax H3 mod_segments[{position}] is not a valid segment tuple.") from exc
+        if segment_length < 3:
+            raise RuntimeError(
+                f"Native MiniMax H3 mod_segments[{position}] must contain start, stop, and modulation index."
+            )
+        try:
+            start = int(segment[0])
+            stop = int(segment[1])
+            modulation_index = int(segment[2])
+        except (TypeError, ValueError, OverflowError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"Native MiniMax H3 mod_segments[{position}] contains non-integer-compatible metadata."
+            ) from exc
+
+        if start < 0 or stop < start or stop > row_count:
+            raise RuntimeError(
+                f"Native MiniMax H3 mod_segments[{position}] range [{start}, {stop}) "
+                f"is outside packed row range 0..{row_count}."
+            )
+        if start < previous_stop:
+            raise RuntimeError(
+                f"Native MiniMax H3 mod_segments[{position}] range [{start}, {stop}) "
+                "overlaps or descends relative to an earlier segment."
+            )
+        previous_stop = max(previous_stop, stop)
+        if start == stop:
+            continue
+        if modulation_index % 3 == 1:
+            language_ranges.append((start, stop))
+    return tuple(language_ranges)
+
+
+class MiniMaxH3BlockReplacePatch(nn.Module):
+    def __init__(self, config: SharedConfig, existing_patch=None):
+        super().__init__()
+        self.config = config
+        self.existing_patch = existing_patch
+
+    def _call_next(self, args: Dict, extra: Dict):
+        if self.existing_patch is not None:
+            return self.existing_patch(args, extra)
+        return extra["original_block"](args)
+
+    def forward(self, args: Dict, extra: Dict):
+        img = args.get("img", None)
+        if not torch.is_tensor(img) or img.ndim != 2:
+            shape = getattr(img, "shape", None)
+            raise RuntimeError(
+                f"Native MiniMax H3 block replacement expected args['img'] as a 2D packed tensor; got shape {shape}."
+            )
+
+        language_ranges = _minimax_h3_language_ranges(args.get("mod_segments", None), int(img.shape[0]))
+        if not language_ranges:
+            return self._call_next(args, extra)
+
+        total_text_rows = sum(stop - start for start, stop in language_ranges)
+        transformer_options = args.get("transformer_options", {}) or {}
+        reference = img.new_empty((1, total_text_rows, 1))
+        alpha = _compute_alpha(reference, total_text_rows, self.config, transformer_options)[0]
+        new_img = img.clone()
+        alpha_offset = 0
+        for start, stop in language_ranges:
+            count = stop - start
+            source = img[start:stop]
+            segment_alpha = alpha[alpha_offset:alpha_offset + count]
+            new_img[start:stop] = source + source * segment_alpha
+            alpha_offset += count
+
+        new_args = dict(args)
+        new_args["img"] = new_img
+        return self._call_next(new_args, extra)
+
+
 class SDXLCrossAttentionPatch(nn.Module):
     def __init__(self, config: SharedConfig, stage_filter: str, targets: Tuple[SdxlTargetSpec, ...]):
         super().__init__()
@@ -760,6 +956,13 @@ def _cache_str(value: Any) -> str:
         return ""
     normalized = re.sub(r"\s+", " ", str(value)).strip()
     return normalized.lower()
+
+
+def _cache_block_indices(value: Any) -> str:
+    try:
+        return ",".join(str(index) for index in _parse_combined_block_indices(str(value)))
+    except (TypeError, ValueError):
+        return _cache_str(value)
 
 
 def _shared_config_fingerprint(
@@ -1038,6 +1241,114 @@ class WanDiffAidSparsePatchNode:
         return patched, summary
 
 
+class MiniMaxH3DiffAidSparsePatchNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "enabled": ("BOOLEAN", {"default": True}),
+                "block_indices": ("STRING", {"default": "1,13,25,37,50", "multiline": False}),
+                "strength": ("FLOAT", {"default": 0.20, "min": -1.0, "max": 1.0, "step": 0.01}),
+                "sigma_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "sigma_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "sigma_ramp": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.5, "step": 0.001, "advanced": True}),
+                "token_weight_mode": (["none", "linear", "exponential"], {"default": "none"}),
+                "token_tail": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01, "advanced": True}),
+                "cond_only": ("BOOLEAN", {"default": True, "advanced": True}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "summary")
+    FUNCTION = "patch"
+    CATEGORY = "model_patches/diffaid"
+
+    @staticmethod
+    def IS_CHANGED(
+        model=None,
+        enabled: bool = True,
+        block_indices: str = "1,13,25,37,50",
+        strength: float = 0.20,
+        sigma_start: float = 0.0,
+        sigma_end: float = 1.0,
+        sigma_ramp: float = 0.0,
+        token_weight_mode: str = "none",
+        token_tail: float = 0.35,
+        cond_only: bool = True,
+    ):
+        return (
+            "minimax_h3_sparse",
+            _cache_bool(enabled),
+            _cache_block_indices(block_indices),
+            _cache_float(strength),
+            _cache_float(sigma_start),
+            _cache_float(sigma_end),
+            _cache_float(sigma_ramp),
+            _cache_str(token_weight_mode),
+            _cache_float(token_tail),
+            _cache_bool(cond_only),
+        )
+
+    def patch(
+        self,
+        model,
+        enabled: bool,
+        block_indices: str,
+        strength: float,
+        sigma_start: float,
+        sigma_end: float,
+        sigma_ramp: float,
+        token_weight_mode: str,
+        token_tail: float,
+        cond_only: bool = True,
+    ):
+        if not enabled:
+            return model, "disabled"
+        if not _is_minimax_h3_model(model):
+            raise ValueError(
+                "This node only supports native ComfyUI MiniMax H3 MODEL objects with packed text/visual/audio/video rows."
+            )
+        if sigma_start > sigma_end:
+            raise ValueError(f"sigma_start ({sigma_start}) must be <= sigma_end ({sigma_end}).")
+
+        requested_indices = _parse_combined_block_indices(block_indices)
+        total_blocks, inner_name = _get_minimax_h3_block_count(model)
+        mapped = _map_indices_to_minimax_h3_blocks(requested_indices, total_blocks)
+        config = SharedConfig(
+            float(strength),
+            float(sigma_start),
+            float(sigma_end),
+            float(sigma_ramp),
+            token_weight_mode,
+            float(token_tail),
+            bool(cond_only),
+        )
+
+        patched = model.clone()
+        existing_model_wrapper = patched.model_options.get("model_function_wrapper")
+        patched.set_model_unet_function_wrapper(SharedTimestepWrapper(existing_wrapper=existing_model_wrapper))
+
+        for block_index in mapped.mapped_0based:
+            existing_patch = _get_existing_dit_replace_patch(patched, "double_block", block_index)
+            patched.set_model_patch_replace(
+                MiniMaxH3BlockReplacePatch(config, existing_patch=existing_patch),
+                "dit",
+                "double_block",
+                block_index,
+            )
+
+        summary = (
+            f"minimax_h3_sparse requested_blocks=[{_fmt_ints(mapped.requested_1based)}]; "
+            f"blocks_0based=[{_fmt_ints(mapped.mapped_0based)}]; cond_only={str(config.cond_only).lower()}; "
+            f"strength={config.strength:.3f}; normalized_sigma_window=[{config.sigma_start:.3f}, {config.sigma_end:.3f}] ramp={config.sigma_ramp:.3f}; "
+            f"token_weight_mode={config.token_weight_mode}; token_tail={config.token_tail:.3f}; "
+            f"text_scope=native_mod_segments_tag_1_only; model_total_blocks={mapped.total}; inner={inner_name or '-'}"
+        )
+        print(f"[ComfyUI-DiffAid-Patches] {summary}")
+        return patched, summary
+
+
 class SDXLDiffAidCrossAttentionPatchNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1133,11 +1444,13 @@ class SDXLDiffAidCrossAttentionPatchNode:
 NODE_CLASS_MAPPINGS = {
     "Flux2DiffAidSparsePatch": Flux2DiffAidSparsePatchNode,
     "WanDiffAidSparsePatch": WanDiffAidSparsePatchNode,
+    "MiniMaxH3DiffAidSparsePatch": MiniMaxH3DiffAidSparsePatchNode,
     "SDXLDiffAidCrossAttentionPatch": SDXLDiffAidCrossAttentionPatchNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Flux2DiffAidSparsePatch": "Flux-family Diff-Aid Sparse Patch",
     "WanDiffAidSparsePatch": "WAN Diff-Aid Sparse Patch",
+    "MiniMaxH3DiffAidSparsePatch": "MiniMax H3 Diff-Aid Sparse Patch",
     "SDXLDiffAidCrossAttentionPatch": "SDXL Diff-Aid Cross-Attention Patch",
 }
