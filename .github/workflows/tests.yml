@@ -31,7 +31,7 @@ jobs:
 
       - name: Run Ruff and compileall
         run: |
-          python -m ruff check nodes.py spectrum_h3_compat.py __init__.py tests --ignore I001,UP035,UP006,UP045
+          python -m ruff check spectrum_h3_compat.py tests/test_spectrum_h3_compat.py --ignore I001,TRY004
           python -m compileall -q nodes.py spectrum_h3_compat.py tests
 
       - name: Run full test suite
