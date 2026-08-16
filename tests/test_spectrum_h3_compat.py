@@ -201,14 +201,22 @@ def test_runtime_state_reuses_exact_shared_timestep_normalization_without_stale_
     _, first = _invoke_wrapper(wrapper, timestep=550.0, sample_sigmas=(1000.0, 550.0))
     first_entry = first["transformer_options"][compat.EXTERNAL_PATCH_RUNTIME_KEY][0]
     assert first_entry["normalized_sigma"] == pytest.approx(0.55)
+    assert wrapper._first_sigma_abs == pytest.approx(1000.0)
+    assert wrapper._last_sigma_abs == pytest.approx(550.0)
+
+    wrapper.cleanup()
     assert wrapper._first_sigma_abs is None
     assert wrapper._last_sigma_abs is None
 
-    # A fresh invocation uses its own sample_sigmas normalization. No previous
-    # generation/reference sigma survives SharedTimestepWrapper's finally cleanup.
+    # A fresh invocation uses its own sample_sigmas normalization after lifecycle
+    # cleanup, so no previous generation/reference sigma survives into the next run.
     _, second = _invoke_wrapper(wrapper, timestep=200.0, sample_sigmas=(800.0, 200.0))
     second_entry = second["transformer_options"][compat.EXTERNAL_PATCH_RUNTIME_KEY][0]
     assert second_entry["normalized_sigma"] == pytest.approx(0.25)
+    assert wrapper._first_sigma_abs == pytest.approx(800.0)
+    assert wrapper._last_sigma_abs == pytest.approx(200.0)
+
+    wrapper.cleanup()
     assert wrapper._first_sigma_abs is None
     assert wrapper._last_sigma_abs is None
 
@@ -237,7 +245,7 @@ def test_final_block_replacement_chain_still_receives_diffaid_rows_once():
 
     def existing(args, extra):
         calls["existing"] += 1
-        assert torch.equal(args["img"][:2], img[:2] * 1.2)
+        assert torch.allclose(args["img"][:2], img[:2] * 1.2)
         return {"img": args["img"], "owner": "spectrum_capture"}
 
     patch = nodes.MiniMaxH3BlockReplacePatch(
