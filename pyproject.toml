@@ -1,7 +1,7 @@
 [project]
 name = "diffaid-patches"
 description = "A ComfyUI custom node pack implementing Diff-Aid-inspired inference-time text-conditioning patches for Flux, MiniMax H3, WAN and SDXL models."
-version = "1.0.5"
+version = "1.0.6"
 license = { file = "LICENSE" }
 
 [project.urls]

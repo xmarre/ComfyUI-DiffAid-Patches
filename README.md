@@ -439,6 +439,12 @@ Load Diffusion Model
 
 The block-replacement chain is preserved when both nodes select the same block, including the final H3 block used by Spectrum for actual-step feature capture. Diff-Aid therefore affects actual transformer evaluations and the history Spectrum fits. Spectrum forecast steps skip transformer execution by design.
 
+For enabled, nonzero H3 patches, Diff-Aid also publishes a small versioned Spectrum compatibility descriptor on the cloned model. The descriptor contains only scalar/configuration metadata and the resolved H3 block indices; it does not retain tensors or model objects. Each model call additionally exposes the normalized sigma value already derived by `SharedTimestepWrapper`, so Spectrum can use the exact same time coordinate without a second normalization pass or CUDA scalar synchronization.
+
+A full `sigma_start=0.0`, `sigma_end=1.0`, `sigma_ramp=0.0` window has no interior on/off boundary and therefore requires no compatibility refresh. For a partial hard window with `sigma_ramp=0.0`, Spectrum can detect the exact inclusive active/inactive transition and promote a would-be forecast on that transition step to one real H3 evaluation. Smooth `sigma_ramp>0` shoulders remain continuous and are not turned into extra forced NFEs solely because their gain changes over time.
+
+This interoperability metadata does not make the MiniMax H3 Diff-Aid port paper-validated. It only makes the deterministic runtime modulation explicit to a compatible Spectrum consumer.
+
 ### H3 validation matrix
 
 Use fixed generation settings and compare all four cases:
