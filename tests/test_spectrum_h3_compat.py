@@ -278,6 +278,29 @@ def test_runtime_state_reuses_exact_shared_timestep_normalization_without_stale_
     assert wrapper._last_sigma_abs is None
 
 
+def test_runtime_sigma_matches_diffaid_float32_coordinate_at_hard_window_boundary():
+    sigma_start = 0.251
+    timestep = 250.99998474121094
+    patched, _ = _patch(sigma_start=sigma_start, sigma_end=1.0, sigma_ramp=0.0)
+    wrapper = patched.model_options["model_function_wrapper"]
+
+    _, seen = _invoke_wrapper(
+        wrapper,
+        timestep=timestep,
+        sample_sigmas=(1000.0, timestep),
+    )
+    transformer_options = seen["transformer_options"]
+    actual_tensor = transformer_options[nodes.STATE_KEY]["normalized_sigma"]
+    actual_scalar = float(actual_tensor.reshape(-1)[0].item())
+    published_scalar = transformer_options[compat.EXTERNAL_PATCH_RUNTIME_KEY][0]["normalized_sigma"]
+    float32_boundary = float(torch.tensor([sigma_start], dtype=torch.float32).item())
+
+    assert abs(timestep) / 1000.0 < sigma_start
+    assert actual_scalar == float32_boundary
+    assert published_scalar == actual_scalar
+    assert nodes._sigma_window_gain(actual_tensor, sigma_start, 1.0, 0.0).item() == 1.0
+
+
 def test_wrapper_chain_still_invokes_preexisting_wrapper_once():
     calls = []
 
