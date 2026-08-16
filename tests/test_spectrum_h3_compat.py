@@ -9,7 +9,23 @@ import nodes
 import spectrum_h3_compat as compat
 
 
-compat.install_spectrum_h3_compat()
+@pytest.fixture(autouse=True)
+def _isolated_compat_installation():
+    original_patch = nodes.MiniMaxH3DiffAidSparsePatchNode.patch
+    original_inject = nodes.SharedTimestepWrapper._inject_state
+    original_installed = compat._INSTALLED
+    original_h3_patch = compat._ORIGINAL_H3_PATCH
+    original_inject_state = compat._ORIGINAL_INJECT_STATE
+
+    compat.install_spectrum_h3_compat()
+    try:
+        yield
+    finally:
+        nodes.MiniMaxH3DiffAidSparsePatchNode.patch = original_patch
+        nodes.SharedTimestepWrapper._inject_state = original_inject
+        compat._INSTALLED = original_installed
+        compat._ORIGINAL_H3_PATCH = original_h3_patch
+        compat._ORIGINAL_INJECT_STATE = original_inject_state
 
 
 class FakeH3Inner:
@@ -96,6 +112,22 @@ def _invoke_wrapper(wrapper, *, timestep=500.0, sample_sigmas=(1000.0, 500.0)):
     return output, seen
 
 
+def test_direct_compat_import_resolves_repository_nodes_module():
+    assert compat._nodes is nodes
+
+
+def test_install_guard_uses_function_markers_when_module_flag_is_stale():
+    installed_patch = nodes.MiniMaxH3DiffAidSparsePatchNode.patch
+    installed_inject = nodes.SharedTimestepWrapper._inject_state
+
+    compat._INSTALLED = False
+    compat.install_spectrum_h3_compat()
+
+    assert nodes.MiniMaxH3DiffAidSparsePatchNode.patch is installed_patch
+    assert nodes.SharedTimestepWrapper._inject_state is installed_inject
+    assert compat._INSTALLED is True
+
+
 def test_enabled_nonzero_h3_publishes_resolved_versioned_descriptor():
     patched, summary = _patch()
     descriptors = _contracts(patched)
@@ -159,6 +191,31 @@ def test_contract_is_owned_only_by_clone_and_source_nested_options_are_unchanged
     assert _contracts(patched)
     assert patched.model_options is not model.model_options
     assert patched.model_options["transformer_options"] is not model.model_options["transformer_options"]
+
+
+def test_wrapper_ownership_failure_does_not_publish_contract(monkeypatch):
+    captured = {}
+
+    def broken_original(_self, model, *_args, **_kwargs):
+        patched = model.clone()
+        patched.model_options["model_function_wrapper"] = object()
+        captured["patched"] = patched
+        return patched, "broken-wrapper"
+
+    monkeypatch.setattr(compat, "_ORIGINAL_H3_PATCH", broken_original)
+
+    with pytest.raises(RuntimeError, match="wrapper ownership changed"):
+        _patch()
+
+    assert compat.EXTERNAL_PATCH_CONTRACTS_KEY not in captured["patched"].model_options
+
+
+def test_inconsistent_installation_state_raises_explicit_error(monkeypatch):
+    wrapper = nodes.SharedTimestepWrapper()
+    monkeypatch.setattr(compat, "_ORIGINAL_INJECT_STATE", None)
+
+    with pytest.raises(RuntimeError, match="lost the original SharedTimestepWrapper"):
+        compat._inject_state_with_spectrum_contract(wrapper, {}, torch.tensor([1.0]))
 
 
 def test_disabled_and_zero_strength_do_not_advertise_active_modulation():
