@@ -1,12 +1,42 @@
 from __future__ import annotations
 
+import importlib.util
 import math
+from pathlib import Path
+import sys
 from typing import Any
 
-try:
+
+def _load_sibling_nodes():
+    sibling = Path(__file__).resolve().with_name("nodes.py")
+    existing = sys.modules.get("nodes")
+    existing_file = getattr(existing, "__file__", None)
+    if existing_file is not None and Path(existing_file).resolve() == sibling:
+        return existing
+
+    module_name = "_comfyui_diffaid_patches_nodes"
+    cached = sys.modules.get(module_name)
+    cached_file = getattr(cached, "__file__", None)
+    if cached_file is not None and Path(cached_file).resolve() == sibling:
+        return cached
+
+    spec = importlib.util.spec_from_file_location(module_name, sibling)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load Diff-Aid sibling module from {sibling}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+if __package__:
     from . import nodes as _nodes
-except ImportError:  # pragma: no cover - direct test/import fallback
-    import nodes as _nodes
+else:  # pragma: no cover - direct test/import fallback
+    _nodes = _load_sibling_nodes()
 
 
 EXTERNAL_PATCH_CONTRACTS_KEY = "spectrum_h3_external_patch_contracts"
@@ -18,6 +48,8 @@ EXTERNAL_PATCH_ARCHITECTURE = "minimax_h3"
 EXTERNAL_PATCH_SCOPE = "native_mod_segments_tag_1_only"
 
 _INSTANCE_ATTR = "_spectrum_h3_external_patch_instance_id"
+_INSTALL_MARKER_ATTR = "_spectrum_h3_compat_install_marker"
+_INSTALL_MARKER_VALUE = f"{EXTERNAL_PATCH_PROVIDER}:v{EXTERNAL_PATCH_SCHEMA_VERSION}"
 _ORIGINAL_H3_PATCH = None
 _ORIGINAL_INJECT_STATE = None
 _INSTALLED = False
@@ -95,7 +127,8 @@ def _normalized_sigma_scalar(wrapper: Any, injected: dict[str, Any]) -> float | 
 
 
 def _inject_state_with_spectrum_contract(self, c: dict[str, Any], timestep: Any) -> dict[str, Any]:
-    assert _ORIGINAL_INJECT_STATE is not None
+    if _ORIGINAL_INJECT_STATE is None:
+        raise RuntimeError("Spectrum H3 compatibility lost the original SharedTimestepWrapper._inject_state target")
     injected = _ORIGINAL_INJECT_STATE(self, c, timestep)
     instance_id = getattr(self, _INSTANCE_ATTR, None)
     if not instance_id:
@@ -136,7 +169,8 @@ def _patch_h3_with_spectrum_contract(
     token_tail: float,
     cond_only: bool = True,
 ):
-    assert _ORIGINAL_H3_PATCH is not None
+    if _ORIGINAL_H3_PATCH is None:
+        raise RuntimeError("Spectrum H3 compatibility lost the original MiniMaxH3DiffAidSparsePatchNode.patch target")
     patched, summary = _ORIGINAL_H3_PATCH(
         self,
         model,
@@ -170,26 +204,41 @@ def _patch_h3_with_spectrum_contract(
     )
 
     model_options = dict(getattr(patched, "model_options", {}) or {})
+    wrapper = model_options.get("model_function_wrapper")
+    if not isinstance(wrapper, _nodes.SharedTimestepWrapper):
+        raise RuntimeError("MiniMax H3 Diff-Aid wrapper ownership changed before compatibility registration")
+
     contracts = _existing_contracts(model_options)
     instance_id = _next_instance_id(contracts)
     contracts.append(_descriptor(mapped, config, instance_id))
     model_options[EXTERNAL_PATCH_CONTRACTS_KEY] = tuple(contracts)
     patched.model_options = model_options
-
-    wrapper = model_options.get("model_function_wrapper")
-    if not isinstance(wrapper, _nodes.SharedTimestepWrapper):
-        raise RuntimeError("MiniMax H3 Diff-Aid wrapper ownership changed before compatibility registration")
     setattr(wrapper, _INSTANCE_ATTR, instance_id)
 
     return patched, f"{summary}; spectrum_h3_contract=v1:{instance_id}"
 
 
+def _is_installed_replacement(value: Any) -> bool:
+    return getattr(value, _INSTALL_MARKER_ATTR, None) == _INSTALL_MARKER_VALUE
+
+
 def install_spectrum_h3_compat() -> None:
     global _INSTALLED, _ORIGINAL_H3_PATCH, _ORIGINAL_INJECT_STATE
-    if _INSTALLED:
+
+    current_patch = _nodes.MiniMaxH3DiffAidSparsePatchNode.patch
+    current_inject = _nodes.SharedTimestepWrapper._inject_state
+    patch_installed = _is_installed_replacement(current_patch)
+    inject_installed = _is_installed_replacement(current_inject)
+    if patch_installed or inject_installed:
+        if not (patch_installed and inject_installed):
+            raise RuntimeError("Spectrum H3 compatibility is only partially installed")
+        _INSTALLED = True
         return
-    _ORIGINAL_H3_PATCH = _nodes.MiniMaxH3DiffAidSparsePatchNode.patch
-    _ORIGINAL_INJECT_STATE = _nodes.SharedTimestepWrapper._inject_state
+
+    _ORIGINAL_H3_PATCH = current_patch
+    _ORIGINAL_INJECT_STATE = current_inject
+    setattr(_patch_h3_with_spectrum_contract, _INSTALL_MARKER_ATTR, _INSTALL_MARKER_VALUE)
+    setattr(_inject_state_with_spectrum_contract, _INSTALL_MARKER_ATTR, _INSTALL_MARKER_VALUE)
     _nodes.MiniMaxH3DiffAidSparsePatchNode.patch = _patch_h3_with_spectrum_contract
     _nodes.SharedTimestepWrapper._inject_state = _inject_state_with_spectrum_contract
     _INSTALLED = True
