@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import math
 from pathlib import Path
+import struct
 import sys
 from typing import Any
 
@@ -53,6 +54,11 @@ _INSTALL_MARKER_VALUE = f"{EXTERNAL_PATCH_PROVIDER}:v{EXTERNAL_PATCH_SCHEMA_VERS
 _ORIGINAL_H3_PATCH = None
 _ORIGINAL_INJECT_STATE = None
 _INSTALLED = False
+
+
+def _float32_scalar(value: float) -> float:
+    """Round a Python scalar exactly once to IEEE-754 binary32."""
+    return struct.unpack("=f", struct.pack("=f", float(value)))[0]
 
 
 def _existing_contracts(model_options: dict[str, Any]) -> list[Any]:
@@ -109,7 +115,12 @@ def _normalized_sigma_scalar(wrapper: Any, injected: dict[str, Any]) -> float | 
             first_value = 0.0
             last_value = math.nan
         if math.isfinite(first_value) and math.isfinite(last_value) and first_value > 0.0:
-            return max(0.0, min(1.0, abs(last_value) / first_value))
+            # SharedTimestepWrapper computes the coordinate in a float32 tensor.
+            # These operands have already been materialized as Python scalars, so
+            # round the reconstructed ratio back to binary32 without another GPU
+            # scalar read/synchronization before publishing it to Spectrum.
+            normalized = max(0.0, min(1.0, abs(last_value) / first_value))
+            return _float32_scalar(normalized)
 
     # The normal path above reuses the Python scalars already materialized by
     # SharedTimestepWrapper._normalized_sigma, so it adds no CUDA synchronization.
@@ -123,7 +134,9 @@ def _normalized_sigma_scalar(wrapper: Any, injected: dict[str, Any]) -> float | 
         value = float(normalized.reshape(-1)[0].item()) if hasattr(normalized, "reshape") else float(normalized)
     except (AttributeError, IndexError, TypeError, ValueError):
         return None
-    return max(0.0, min(1.0, value)) if math.isfinite(value) else None
+    if not math.isfinite(value):
+        return None
+    return _float32_scalar(max(0.0, min(1.0, value)))
 
 
 def _inject_state_with_spectrum_contract(self, c: dict[str, Any], timestep: Any) -> dict[str, Any]:
