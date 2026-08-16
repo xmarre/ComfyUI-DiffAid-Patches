@@ -85,6 +85,18 @@ def _next_instance_id(existing: list[Any]) -> str:
 
 
 def _descriptor(mapped: Any, config: Any, instance_id: str) -> dict[str, Any]:
+    sigma_ramp = float(config.sigma_ramp)
+    # Diff-Aid compares hard-window bounds against a float32 normalized-sigma
+    # tensor, so those Python widget scalars are effectively cast to binary32.
+    # Publish those effective hard boundaries so Spectrum's Python-side regime
+    # comparison classifies the same inclusive window.
+    if sigma_ramp == 0.0:
+        sigma_start = _float32_scalar(config.sigma_start)
+        sigma_end = _float32_scalar(config.sigma_end)
+    else:
+        sigma_start = float(config.sigma_start)
+        sigma_end = float(config.sigma_end)
+
     return {
         "schema_version": EXTERNAL_PATCH_SCHEMA_VERSION,
         "provider": EXTERNAL_PATCH_PROVIDER,
@@ -94,9 +106,9 @@ def _descriptor(mapped: Any, config: Any, instance_id: str) -> dict[str, Any]:
         "block_indices_0based": list(mapped.mapped_0based),
         "model_block_count": int(mapped.total),
         "strength": float(config.strength),
-        "sigma_start": float(config.sigma_start),
-        "sigma_end": float(config.sigma_end),
-        "sigma_ramp": float(config.sigma_ramp),
+        "sigma_start": sigma_start,
+        "sigma_end": sigma_end,
+        "sigma_ramp": sigma_ramp,
         "token_weight_mode": str(config.token_weight_mode),
         "token_tail": float(config.token_tail),
         "cond_only": bool(config.cond_only),
