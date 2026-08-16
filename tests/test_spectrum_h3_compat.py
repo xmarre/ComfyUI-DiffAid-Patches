@@ -293,11 +293,14 @@ def test_runtime_sigma_matches_diffaid_float32_coordinate_at_hard_window_boundar
     actual_tensor = transformer_options[nodes.STATE_KEY]["normalized_sigma"]
     actual_scalar = float(actual_tensor.reshape(-1)[0].item())
     published_scalar = transformer_options[compat.EXTERNAL_PATCH_RUNTIME_KEY][0]["normalized_sigma"]
+    descriptor = _contracts(patched)[0]
     float32_boundary = float(torch.tensor([sigma_start], dtype=torch.float32).item())
 
     assert abs(timestep) / 1000.0 < sigma_start
     assert actual_scalar == float32_boundary
     assert published_scalar == actual_scalar
+    assert descriptor["sigma_start"] == float32_boundary
+    assert descriptor["sigma_start"] <= published_scalar <= descriptor["sigma_end"]
     assert nodes._sigma_window_gain(actual_tensor, sigma_start, 1.0, 0.0).item() == 1.0
 
 
