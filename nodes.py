@@ -807,10 +807,9 @@ def _minimax_h3_language_ranges(mod_segments: Any, row_count: int) -> Tuple[Tupl
         try:
             start = int(segment[0])
             stop = int(segment[1])
-            modulation_index = int(segment[2])
         except (TypeError, ValueError, OverflowError, RuntimeError) as exc:
             raise RuntimeError(
-                f"Native MiniMax H3 mod_segments[{position}] contains non-integer-compatible metadata."
+                f"Native MiniMax H3 mod_segments[{position}] contains non-integer-compatible range metadata."
             ) from exc
 
         if start < 0 or stop < start or stop > row_count:
@@ -826,6 +825,41 @@ def _minimax_h3_language_ranges(mod_segments: Any, row_count: int) -> Tuple[Tupl
         previous_stop = max(previous_stop, stop)
         if start == stop:
             continue
+
+        modulation_metadata = segment[2]
+        if torch.is_tensor(modulation_metadata) and modulation_metadata.numel() != 1:
+            # Current native H3 denoise masks represent target video/audio
+            # modulation rows as one LongTensor index per packed row. Text
+            # presentation runs remain scalar tag-1 segments, so per-row target
+            # metadata must be validated but excluded from Diff-Aid text scope.
+            expected_rows = stop - start
+            if modulation_metadata.ndim != 1 or int(modulation_metadata.numel()) != expected_rows:
+                raise RuntimeError(
+                    f"Native MiniMax H3 mod_segments[{position}] per-row modulation metadata "
+                    f"must be a 1D tensor with {expected_rows} entries; got shape "
+                    f"{tuple(modulation_metadata.shape)}."
+                )
+            if (
+                modulation_metadata.dtype == torch.bool
+                or torch.is_floating_point(modulation_metadata)
+                or torch.is_complex(modulation_metadata)
+            ):
+                raise RuntimeError(
+                    f"Native MiniMax H3 mod_segments[{position}] per-row modulation metadata "
+                    f"must use an integer dtype; got {modulation_metadata.dtype}."
+                )
+            continue
+
+        try:
+            if torch.is_tensor(modulation_metadata):
+                modulation_index = int(modulation_metadata.item())
+            else:
+                modulation_index = int(modulation_metadata)
+        except (TypeError, ValueError, OverflowError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"Native MiniMax H3 mod_segments[{position}] contains non-integer-compatible modulation metadata."
+            ) from exc
+
         if modulation_index % 3 == 1:
             language_ranges.append((start, stop))
     return tuple(language_ranges)

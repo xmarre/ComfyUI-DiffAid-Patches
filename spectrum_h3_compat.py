@@ -7,6 +7,8 @@ import struct
 import sys
 from typing import Any
 
+import torch
+
 
 def _load_sibling_nodes():
     sibling = Path(__file__).resolve().with_name("nodes.py")
@@ -47,12 +49,15 @@ EXTERNAL_PATCH_PROVIDER = "comfyui-diffaid-patches"
 EXTERNAL_PATCH_KIND = "text_activation_modulation"
 EXTERNAL_PATCH_ARCHITECTURE = "minimax_h3"
 EXTERNAL_PATCH_SCOPE = "native_mod_segments_tag_1_only"
+H3_REFINEMENT_REQUEST_KEY = "h3_refinement"
+H3_REFINEMENT_API = 1
 
 _INSTANCE_ATTR = "_spectrum_h3_external_patch_instance_id"
 _INSTALL_MARKER_ATTR = "_spectrum_h3_compat_install_marker"
 _INSTALL_MARKER_VALUE = f"{EXTERNAL_PATCH_PROVIDER}:v{EXTERNAL_PATCH_SCHEMA_VERSION}"
 _ORIGINAL_H3_PATCH = None
 _ORIGINAL_INJECT_STATE = None
+_ORIGINAL_NORMALIZED_SIGMA = None
 _INSTALLED = False
 
 
@@ -114,6 +119,62 @@ def _descriptor(mapped: Any, config: Any, instance_id: str) -> dict[str, Any]:
         "cond_only": bool(config.cond_only),
         "scope": EXTERNAL_PATCH_SCOPE,
     }
+
+
+def _refinement_sigma_reference(transformer_options: dict[str, Any] | None) -> float | None:
+    """Resolve the explicit full-trajectory coordinate for sampler-2 refinement.
+
+    Ordinary Diff-Aid runs intentionally normalize against the first sigma of the
+    current invocation.  A learned-latent refinement is different: it resumes at
+    low sigma, so renormalizing its first call to 1.0 creates an artificial hard
+    off->on patch transition.  Only a complete API-v1 refinement contract opts in
+    to the full H3 sigma reference.
+    """
+    if not isinstance(transformer_options, dict):
+        return None
+    request = transformer_options.get(H3_REFINEMENT_REQUEST_KEY)
+    if not isinstance(request, dict):
+        return None
+
+    api = request.get("api")
+    active = request.get("active")
+    prefix = request.get("min_actual_prefix_steps")
+    sigma_reference = request.get("sigma_reference")
+    if type(api) is not int or type(active) is not bool or type(prefix) is not int:
+        return None
+    if api != H3_REFINEMENT_API or active is not True or prefix < 0:
+        return None
+    if isinstance(sigma_reference, bool) or not isinstance(sigma_reference, (int, float)):
+        return None
+    sigma_reference = float(sigma_reference)
+    if not math.isfinite(sigma_reference) or sigma_reference <= 0.0:
+        return None
+    return sigma_reference
+
+
+def _normalized_sigma_with_refinement(
+    self,
+    timestep: Any,
+    device: torch.device,
+    transformer_options: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    reference = _refinement_sigma_reference(transformer_options)
+    if reference is None:
+        if _ORIGINAL_NORMALIZED_SIGMA is None:
+            raise RuntimeError("Spectrum H3 compatibility lost the original SharedTimestepWrapper._normalized_sigma target")
+        return _ORIGINAL_NORMALIZED_SIGMA(
+            self,
+            timestep,
+            device=device,
+            transformer_options=transformer_options,
+        )
+
+    t = _nodes._as_float_tensor(timestep, device=device)
+    if t is None or t.numel() == 0:
+        return torch.tensor([1.0], device=device, dtype=torch.float32)
+    self._first_sigma_abs = reference
+    self._last_sigma_abs = float(t.abs().max().item())
+    return (t.abs() / reference).clamp(0.0, 1.0)
 
 
 def _normalized_sigma_scalar(wrapper: Any, injected: dict[str, Any]) -> float | None:
@@ -248,24 +309,29 @@ def _is_installed_replacement(value: Any) -> bool:
 
 
 def install_spectrum_h3_compat() -> None:
-    global _INSTALLED, _ORIGINAL_H3_PATCH, _ORIGINAL_INJECT_STATE
+    global _INSTALLED, _ORIGINAL_H3_PATCH, _ORIGINAL_INJECT_STATE, _ORIGINAL_NORMALIZED_SIGMA
 
     current_patch = _nodes.MiniMaxH3DiffAidSparsePatchNode.patch
     current_inject = _nodes.SharedTimestepWrapper._inject_state
+    current_normalized = _nodes.SharedTimestepWrapper._normalized_sigma
     patch_installed = _is_installed_replacement(current_patch)
     inject_installed = _is_installed_replacement(current_inject)
-    if patch_installed or inject_installed:
-        if not (patch_installed and inject_installed):
+    normalized_installed = _is_installed_replacement(current_normalized)
+    if patch_installed or inject_installed or normalized_installed:
+        if not (patch_installed and inject_installed and normalized_installed):
             raise RuntimeError("Spectrum H3 compatibility is only partially installed")
         _INSTALLED = True
         return
 
     _ORIGINAL_H3_PATCH = current_patch
     _ORIGINAL_INJECT_STATE = current_inject
+    _ORIGINAL_NORMALIZED_SIGMA = current_normalized
     setattr(_patch_h3_with_spectrum_contract, _INSTALL_MARKER_ATTR, _INSTALL_MARKER_VALUE)
     setattr(_inject_state_with_spectrum_contract, _INSTALL_MARKER_ATTR, _INSTALL_MARKER_VALUE)
+    setattr(_normalized_sigma_with_refinement, _INSTALL_MARKER_ATTR, _INSTALL_MARKER_VALUE)
     _nodes.MiniMaxH3DiffAidSparsePatchNode.patch = _patch_h3_with_spectrum_contract
     _nodes.SharedTimestepWrapper._inject_state = _inject_state_with_spectrum_contract
+    _nodes.SharedTimestepWrapper._normalized_sigma = _normalized_sigma_with_refinement
     _INSTALLED = True
 
 
@@ -277,5 +343,7 @@ __all__ = [
     "EXTERNAL_PATCH_RUNTIME_KEY",
     "EXTERNAL_PATCH_SCHEMA_VERSION",
     "EXTERNAL_PATCH_SCOPE",
+    "H3_REFINEMENT_API",
+    "H3_REFINEMENT_REQUEST_KEY",
     "install_spectrum_h3_compat",
 ]

@@ -13,9 +13,11 @@ import spectrum_h3_compat as compat
 def _isolated_compat_installation():
     original_patch = nodes.MiniMaxH3DiffAidSparsePatchNode.patch
     original_inject = nodes.SharedTimestepWrapper._inject_state
+    original_normalized = nodes.SharedTimestepWrapper._normalized_sigma
     original_installed = compat._INSTALLED
     original_h3_patch = compat._ORIGINAL_H3_PATCH
     original_inject_state = compat._ORIGINAL_INJECT_STATE
+    original_normalized_sigma = compat._ORIGINAL_NORMALIZED_SIGMA
 
     compat.install_spectrum_h3_compat()
     try:
@@ -23,9 +25,11 @@ def _isolated_compat_installation():
     finally:
         nodes.MiniMaxH3DiffAidSparsePatchNode.patch = original_patch
         nodes.SharedTimestepWrapper._inject_state = original_inject
+        nodes.SharedTimestepWrapper._normalized_sigma = original_normalized
         compat._INSTALLED = original_installed
         compat._ORIGINAL_H3_PATCH = original_h3_patch
         compat._ORIGINAL_INJECT_STATE = original_inject_state
+        compat._ORIGINAL_NORMALIZED_SIGMA = original_normalized_sigma
 
 
 class FakeH3Inner:
@@ -92,24 +96,39 @@ def _contracts(model):
     return model.model_options.get(compat.EXTERNAL_PATCH_CONTRACTS_KEY, ())
 
 
-def _invoke_wrapper(wrapper, *, timestep=500.0, sample_sigmas=(1000.0, 500.0)):
+def _invoke_wrapper(
+    wrapper,
+    *,
+    timestep=500.0,
+    sample_sigmas=(1000.0, 500.0),
+    transformer_overrides=None,
+):
     seen = {}
 
     def model_function(input_x, timestep, **conditioning):
         seen.update(conditioning)
         return input_x
 
+    transformer_options = {
+        "sample_sigmas": torch.tensor(sample_sigmas, dtype=torch.float32)
+    }
+    transformer_options.update(transformer_overrides or {})
     params = {
         "input": torch.ones(1),
         "timestep": torch.tensor([timestep]),
-        "c": {
-            "transformer_options": {
-                "sample_sigmas": torch.tensor(sample_sigmas, dtype=torch.float32)
-            }
-        },
+        "c": {"transformer_options": transformer_options},
     }
     output = wrapper(model_function, params)
     return output, seen
+
+
+def _refinement_contract(*, sigma_reference=1.0, prefix=0):
+    return {
+        "api": 1,
+        "active": True,
+        "min_actual_prefix_steps": prefix,
+        "sigma_reference": sigma_reference,
+    }
 
 
 def test_direct_compat_import_resolves_repository_nodes_module():
@@ -119,12 +138,14 @@ def test_direct_compat_import_resolves_repository_nodes_module():
 def test_install_guard_uses_function_markers_when_module_flag_is_stale():
     installed_patch = nodes.MiniMaxH3DiffAidSparsePatchNode.patch
     installed_inject = nodes.SharedTimestepWrapper._inject_state
+    installed_normalized = nodes.SharedTimestepWrapper._normalized_sigma
 
     compat._INSTALLED = False
     compat.install_spectrum_h3_compat()
 
     assert nodes.MiniMaxH3DiffAidSparsePatchNode.patch is installed_patch
     assert nodes.SharedTimestepWrapper._inject_state is installed_inject
+    assert nodes.SharedTimestepWrapper._normalized_sigma is installed_normalized
     assert compat._INSTALLED is True
 
 
@@ -276,6 +297,58 @@ def test_runtime_state_reuses_exact_shared_timestep_normalization_without_stale_
     wrapper.cleanup()
     assert wrapper._first_sigma_abs is None
     assert wrapper._last_sigma_abs is None
+
+
+def test_marked_h3_refinement_uses_full_trajectory_sigma_reference():
+    patched, _ = _patch(sigma_start=0.0, sigma_end=0.95, sigma_ramp=0.0)
+    wrapper = patched.model_options["model_function_wrapper"]
+    marker = {compat.H3_REFINEMENT_REQUEST_KEY: _refinement_contract(sigma_reference=1.0)}
+
+    _, first = _invoke_wrapper(
+        wrapper,
+        timestep=0.72,
+        sample_sigmas=(0.72, 0.55, 0.26, 0.0),
+        transformer_overrides=marker,
+    )
+    first_options = first["transformer_options"]
+    first_sigma = first_options[compat.EXTERNAL_PATCH_RUNTIME_KEY][0]["normalized_sigma"]
+    first_tensor = first_options[nodes.STATE_KEY]["normalized_sigma"]
+
+    _, middle = _invoke_wrapper(
+        wrapper,
+        timestep=0.55,
+        sample_sigmas=(0.72, 0.55, 0.26, 0.0),
+        transformer_overrides=marker,
+    )
+    middle_options = middle["transformer_options"]
+    middle_sigma = middle_options[compat.EXTERNAL_PATCH_RUNTIME_KEY][0]["normalized_sigma"]
+    middle_tensor = middle_options[nodes.STATE_KEY]["normalized_sigma"]
+
+    assert first_sigma == pytest.approx(0.72)
+    assert middle_sigma == pytest.approx(0.55)
+    assert wrapper._first_sigma_abs == pytest.approx(1.0)
+    assert nodes._sigma_window_gain(first_tensor, 0.0, 0.95, 0.0).item() == 1.0
+    assert nodes._sigma_window_gain(middle_tensor, 0.0, 0.95, 0.0).item() == 1.0
+
+
+def test_invalid_refinement_marker_keeps_existing_run_local_sigma_semantics():
+    patched, _ = _patch(sigma_start=0.0, sigma_end=0.95, sigma_ramp=0.0)
+    wrapper = patched.model_options["model_function_wrapper"]
+    marker = {
+        compat.H3_REFINEMENT_REQUEST_KEY: _refinement_contract(
+            sigma_reference=float("nan")
+        )
+    }
+
+    _, seen = _invoke_wrapper(
+        wrapper,
+        timestep=0.72,
+        sample_sigmas=(0.72, 0.55, 0.26, 0.0),
+        transformer_overrides=marker,
+    )
+    normalized = seen["transformer_options"][compat.EXTERNAL_PATCH_RUNTIME_KEY][0]["normalized_sigma"]
+    assert normalized == pytest.approx(1.0)
+    assert wrapper._first_sigma_abs == pytest.approx(0.72)
 
 
 def test_runtime_sigma_matches_diffaid_float32_coordinate_at_hard_window_boundary():
