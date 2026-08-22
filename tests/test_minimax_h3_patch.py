@@ -280,6 +280,48 @@ def test_metadata_failures_are_descriptive(segments, match):
         run_patch(patch, img, segments)
 
 
+def test_native_mask_per_row_modulation_metadata_preserves_text_only_scope():
+    img, mod_segments = packed_case()
+    mod_segments[-2] = (9, 11, torch.tensor([5, 8], dtype=torch.long))
+    mod_segments[-1] = (11, 14, torch.tensor([6, 9, 12], dtype=torch.long))
+    patch = nodes.MiniMaxH3BlockReplacePatch(config(strength=0.25))
+
+    output, _, calls = run_patch(patch, img, mod_segments)
+    result = output["img"]
+
+    linguistic = torch.tensor([0, 1, 3, 4])
+    preserved = torch.tensor([2, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+    assert torch.equal(result[linguistic], img[linguistic] * 1.25)
+    assert torch.equal(result[preserved], img[preserved])
+    assert calls["original"] == 1
+
+
+@pytest.mark.parametrize(
+    "metadata,match",
+    [
+        (torch.tensor([5], dtype=torch.long).repeat(3), "1D tensor with 2 entries"),
+        (torch.tensor([[5, 8]], dtype=torch.long), "1D tensor with 2 entries"),
+        (torch.tensor([5.0, 8.0]), "must use an integer dtype"),
+    ],
+)
+def test_native_mask_per_row_modulation_metadata_is_shape_and_dtype_checked(metadata, match):
+    img, _ = packed_case()
+    segments = [(0, 2, 1), (2, 4, metadata), (4, 14, 0)]
+    patch = nodes.MiniMaxH3BlockReplacePatch(config())
+    with pytest.raises(RuntimeError, match=match):
+        run_patch(patch, img, segments)
+
+
+def test_scalar_tensor_modulation_metadata_keeps_legacy_tag_semantics():
+    img, _ = packed_case()
+    segments = [(0, 2, torch.tensor(1, dtype=torch.long)), (2, 14, 0)]
+    patch = nodes.MiniMaxH3BlockReplacePatch(config(strength=0.25))
+    output, _, _ = run_patch(patch, img, segments)
+
+    assert torch.equal(output["img"][:2], img[:2] * 1.25)
+    assert torch.equal(output["img"][2:], img[2:])
+
+
 def test_no_tag_one_rows_is_safe_noop():
     img, _ = packed_case()
     segments = [(0, 7, 0), (7, 14, 2)]

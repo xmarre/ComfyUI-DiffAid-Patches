@@ -1,78 +1,44 @@
-# ComfyUI-DiffAid-Patches v1.0.6
+# ComfyUI-DiffAid-Patches v1.0.7
 
-v1.0.6 is the first tagged GitHub release of the current Diff-Aid patch pack. It packages the four supported ComfyUI nodes, the completed MiniMax H3 integration, and the coordinated Spectrum MiniMax H3 compatibility contract that was validated in real native H3 generations.
+v1.0.7 completes MiniMax H3 Native Masked and learned-latent refinement interoperability with the coordinated H3 Continuum / Spectrum workflow.
 
-## Included nodes
+## Native Masked MiniMax H3 metadata
 
-- **Flux-family Diff-Aid Sparse Patch** — sparse text-conditioning modulation for Flux-family transformer layouts.
-- **WAN Diff-Aid Sparse Patch** — experimental sparse context modulation for native WAN-family video models.
-- **MiniMax H3 Diff-Aid Sparse Patch** — experimental text-only modulation for native MiniMax H3 packed sequences, using `mod_segments` as the authoritative modality layout.
-- **SDXL Diff-Aid Cross-Attention Patch** — an SDXL cross-attention adaptation of the same inference-time conditioning idea.
+Core MiniMax H3 may represent target audio/video modulation metadata as per-row integer tensors when denoise masks are active. DiffAid now accepts that native representation without attempting to coerce the whole vector to one scalar modality tag.
 
-## MiniMax H3 + Spectrum interoperability
+- Scalar `mod_segments` behavior is unchanged.
+- Valid 1-D integer per-row target metadata is accepted only when its length matches the packed segment range.
+- Per-row target VIDEO/AUDIO metadata remains outside DiffAid's text-only modification scope.
+- DiffAid continues modifying only scalar MiniMax H3 text modality-tag `1` segments.
+- Malformed vector dtype/shape/length fails explicitly.
+- Composition with pre-existing H3 block replacements remains covered.
 
-v1.0.6 publishes the producer half of the versioned Diff-Aid ↔ Spectrum MiniMax H3 external-patch contract. Spectrum MiniMax H3 v0.2.12+ is the matching consumer.
+## Marked sampler-2 refinement sigma semantics
 
-For an enabled nonzero H3 patch, Diff-Aid now publishes pure scalar/configuration metadata describing the resolved activation modulation and exposes the exact normalized sigma already derived by the H3 timestep wrapper. The contract does not retain tensors or model objects and does not add a second CUDA scalar synchronization.
+Ordinary DiffAid sampling keeps its existing run-local normalized sigma semantics. A learned-latent second pass is different: it is a low-sigma continuation of the native H3 trajectory.
 
-This lets Spectrum distinguish Diff-Aid's deterministic text-activation modulation from LoRA/model-parameter perturbation, preserve cache identity across patched and unpatched configurations, and protect hard sigma-window regime changes without inflating Spectrum's calibrated model-aware patch-risk prior.
+For a MODEL explicitly marked with the `h3_refinement` API-v1 contract, DiffAid now evaluates its sigma window against the producer-supplied full native H3 sigma reference instead of renormalizing the first refinement call to `1.0`.
 
-Validated workflow order:
+This removes the artificial off->on transition that previously appeared in a three-step partial-denoise refinement with a `0.00..0.95` DiffAid window. The model function stays in the same DiffAid regime across the first and middle refinement calls, so Spectrum can forecast the middle step without weakening its hard-transition safety rule.
+
+Malformed or absent refinement metadata falls back to the existing run-local behavior.
+
+## Coordinated runtime validation
+
+The complete CUDA workflow was validated with H3 Continuum exact `refine_state`, the learned MiniMax H3 latent upscaler/refiner, Spectrum, DiffAid and Untwisting RoPE metadata active together.
+
+In the validated three-step sampler-2 run:
 
 ```text
-Load Diffusion Model
--> MiniMax H3 Diff-Aid Sparse Patch
--> Spectrum Apply MiniMax H3
--> guider / scheduler
+step 0: actual
+step 1: forecast
+step 2: actual
 ```
 
-### Coordinated real-runtime validation
+The previous artificial DiffAid `false->true` transition no longer appeared at the middle step. Spectrum reported `2 actual + 1 forecast` per refined chunk and the resulting media quality was user-validated as impeccable.
 
-Native MiniMax H3, ER-SDE, 20 steps, Spectrum `model_aware_mode=full`, Diff-Aid blocks `1,13,25,37,50`, strength `0.5`:
+## Validation
 
-| Run | Diff-Aid window | Actual / forecast | Sampler time | Compatibility result |
-|---|---|---:|---:|---|
-| Spectrum control | inactive | 11 / 9 | 187.236 s | 0 model-aware extra NFEs |
-| Diff-Aid full hard window | `[0.0,1.0]` | 11 / 9 | 189.001 s | 0 transitions, 0 forced actuals, 0 extra NFEs |
-| Diff-Aid partial hard window | `[0.0,0.95]` | 11 / 9 | 184.946 s | transition detected at normalized sigma `0.947368` on an already-actual step; 0 extra NFEs |
+The release branch passes Ruff/compileall and the complete pytest suite covering scalar and vector H3 metadata, malformed-vector fail-closed behavior, normal run-local sigma normalization, marked-refinement full-trajectory normalization, patch runtime state consistency, and compatibility wrapper lifecycle.
 
-All three runs preserved Spectrum's normal 11-actual / 9-forecast budget. In the matched multi-shot media test, the partial hard window also restored the intended cut between shots while retaining the observed prompt-adherence enhancement. Treat that media result as an empirical workflow result, not a universal default.
-
-## Relationship to the Diff-Aid paper
-
-This repository remains a **Diff-Aid-inspired inference-time patch pack**, not a paper-exact reproduction.
-
-The paper's full method trains lightweight Aid modules that predict adaptive per-token modulation from text features with block and timestep awareness. This repository does not ship the trained Aid MLP or learned Aid weights. Its Flux sparse path is motivated by the paper appendix's explicit sparse-enhancement experiment, while the MiniMax H3, WAN, and SDXL ports are architecture-specific experimental adaptations.
-
-The paper evaluates FLUX and SD 3.5 text-to-image generation and explicitly lists extension to modalities such as text-to-video as future work. No paper-level quality claim is made here for MiniMax H3 or WAN.
-
-## Reliability and CI
-
-The v1.0.6 release head passed the repository's automated checks before this release work:
-
-- **55 pytest tests passed** on Python 3.12;
-- Ruff compatibility checks passed;
-- `compileall` passed;
-- the Comfy registry publish for v1.0.6 completed successfully.
-
-The repository now also uses the same release pattern as Spectrum MiniMax H3:
-
-- GitHub releases are created only after the `tests` workflow succeeds for a push to `main`;
-- the release targets the exact tested commit SHA;
-- the version is read from `pyproject.toml`;
-- the release contains `ComfyUI-DiffAid-Patches-v1.0.6.zip` plus `SHA256SUMS`;
-- an existing tag/release is left untouched, making the workflow idempotent;
-- the Comfy registry workflow pins its checkout and publish actions to reviewed commit SHAs and does not persist checkout credentials.
-
-## Installation / update
-
-For an existing checkout:
-
-```bash
-cd ComfyUI/custom_nodes/ComfyUI-DiffAid-Patches
-git pull
-```
-
-Restart ComfyUI after updating.
-
-For Spectrum + MiniMax H3 interoperability, use **ComfyUI-DiffAid-Patches v1.0.6+** with **ComfyUI-Spectrum-MiniMax-H3 v0.2.12+** and keep the patch order shown above.
+This release is coordinated with Spectrum MiniMax H3 v0.2.17, H3 Continuum v3.4.1, and the integrated MiniMax H3 Latent Upscaler + Refine release.
