@@ -539,6 +539,10 @@ def _get_minimax_h3_block_count(model) -> Tuple[int, Optional[str]]:
 
 
 KREA2_EXPERIMENTAL_BLOCKS: Tuple[int, ...] = (1, 8, 15, 22, 28)
+# comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL; kept literal so the
+# node module imports without ComfyUI (unit tests).
+KREA2_DIFFUSION_MODEL_WRAPPER_TYPE = "diffusion_model"
+KREA2_MODULATION_TARGETS: Tuple[str, ...] = ("text_residual", "values_only", "keys_and_values")
 
 
 def _get_krea2_block_count(model) -> int:
@@ -798,6 +802,65 @@ class Krea2AttentionPatch(nn.Module):
         if self.attention_target == "keys_and_values":
             result["k"] = torch.cat((k[:, :, :text_length, :] * gain, k[:, :, text_length:, :]), dim=2)
         return result
+
+
+class Krea2TextResidualWrapper:
+    """Diffusion-model wrapper that scales the text prefix of selected Krea 2 block inputs.
+
+    This is the Krea 2 counterpart of the Flux single-stream patch: text rows of
+    the shared residual stream are scaled by ``1 + alpha`` immediately before a
+    selected block. Krea 2 does not dispatch DiT block-replacement patches, so
+    temporary forward pre-hooks are registered on the selected blocks for the
+    duration of one diffusion-model call and always removed afterwards. Module
+    weights and structure are never replaced.
+    """
+
+    WRAPPER_KEY = "diffaid_krea2_text_residual"
+
+    def __init__(self, config: SharedConfig, selected_blocks: Sequence[int]):
+        self.config = config
+        self.selected_blocks = tuple(sorted(set(int(i) for i in selected_blocks)))
+        self._active = False
+
+    def __call__(self, executor, *args, **kwargs):
+        if self._active:
+            # Re-entrant call of the same diffusion model: hooks are already installed.
+            return executor(*args, **kwargs)
+        blocks = getattr(getattr(executor, "class_obj", None), "blocks", None)
+        if blocks is None:
+            raise ValueError("Krea 2 text-residual modulation requires the native diffusion model blocks list.")
+        if self.selected_blocks and self.selected_blocks[-1] >= len(blocks):
+            raise ValueError(f"Krea 2 block indices exceed the model's {len(blocks)} blocks.")
+        handles = []
+        self._active = True
+        try:
+            for index in self.selected_blocks:
+                handles.append(blocks[index].register_forward_pre_hook(self._pre_hook, with_kwargs=True))
+            return executor(*args, **kwargs)
+        finally:
+            for handle in handles:
+                handle.remove()
+            self._active = False
+
+    def _pre_hook(self, module, args, kwargs):
+        options = kwargs.get("transformer_options") or {}
+        if not args:
+            raise ValueError("Krea 2 block was called without its hidden-state input.")
+        x = args[0]
+        image_slice = options.get("img_slice")
+        if not isinstance(image_slice, (tuple, list)) or len(image_slice) != 2:
+            raise ValueError("Krea 2 text-residual modulation requires native img_slice text-prefix metadata.")
+        text_length = int(image_slice[0])
+        if text_length < 0:
+            raise ValueError("Krea 2 text-token count cannot be negative.")
+        if text_length == 0:
+            return None
+        if x.ndim != 3 or text_length > x.shape[1]:
+            raise ValueError("Krea 2 text-token prefix exceeds the block input sequence length.")
+        prefix = x[:, :text_length, :]
+        alpha = _compute_alpha(prefix, text_length, self.config, options)
+        new_x = torch.cat((prefix + prefix * alpha, x[:, text_length:, :]), dim=1)
+        return (new_x, *args[1:]), kwargs
 
 
 class WanBlockReplacePatch(nn.Module):
@@ -1255,8 +1318,8 @@ class Krea2DiffAidSparsePatchNode:
                 ),
                 "block_indices": ("STRING", {"default": "1,8,15,22,28", "multiline": False, "advanced": True}),
                 "strength": ("FLOAT", {"default": 0.15, "min": -1.0, "max": 1.0, "step": 0.01}),
-                "attention_target": (
-                    ["keys_and_values", "values_only"], {"default": "keys_and_values"}
+                "modulation_target": (
+                    list(KREA2_MODULATION_TARGETS), {"default": "text_residual"}
                 ),
                 "sigma_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
                 "sigma_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
@@ -1279,7 +1342,7 @@ class Krea2DiffAidSparsePatchNode:
         block_preset: str = "uniform_five_experimental",
         block_indices: str = "1,8,15,22,28",
         strength: float = 0.15,
-        attention_target: str = "keys_and_values",
+        modulation_target: str = "text_residual",
         sigma_start: float = 0.0,
         sigma_end: float = 1.0,
         sigma_ramp: float = 0.0,
@@ -1292,7 +1355,7 @@ class Krea2DiffAidSparsePatchNode:
             "krea2_sparse",
             _cache_str(block_preset),
             _cache_block_indices(block_indices) if custom else "",
-            _cache_str(attention_target),
+            _cache_str(modulation_target),
             *_shared_config_fingerprint(
                 enabled=enabled,
                 strength=strength,
@@ -1312,7 +1375,7 @@ class Krea2DiffAidSparsePatchNode:
         block_preset: str,
         block_indices: str,
         strength: float,
-        attention_target: str,
+        modulation_target: str,
         sigma_start: float,
         sigma_end: float,
         sigma_ramp: float,
@@ -1335,25 +1398,38 @@ class Krea2DiffAidSparsePatchNode:
             raise ValueError(f"Unknown Krea 2 block preset: {block_preset}.")
         if any(index > total for index in indices):
             raise ValueError(f"Krea 2 block indices must be in range 1..{total}.")
+        if modulation_target not in KREA2_MODULATION_TARGETS:
+            raise ValueError(f"Unsupported Krea 2 modulation target: {modulation_target}.")
         config = SharedConfig(
             float(strength), float(sigma_start), float(sigma_end), float(sigma_ramp),
             token_weight_mode, float(token_tail), bool(cond_only),
         )
-        # The native Krea 2 DiT does not invoke patches_replace["dit"]; it
-        # invokes patches["attn1_patch"] after per-head QK normalization.
+        # The native Krea 2 DiT does not invoke patches_replace["dit"].
+        # text_residual: scale text rows of selected block inputs (Flux
+        # single-stream equivalent) via a diffusion-model wrapper.
+        # values_only / keys_and_values: attn1_patch after per-head QK norm.
         patched = model.clone()
         previous_wrapper = patched.model_options.get("model_function_wrapper")
         patched.set_model_unet_function_wrapper(SharedTimestepWrapper(existing_wrapper=previous_wrapper))
-        patched.set_model_attn1_patch(
-            Krea2AttentionPatch(config, [index - 1 for index in indices], attention_target)
-        )
+        selected = [index - 1 for index in indices]
+        if modulation_target == "text_residual":
+            add_wrapper = getattr(patched, "add_wrapper_with_key", None)
+            if not callable(add_wrapper):
+                raise ValueError("Krea 2 text_residual modulation requires a ComfyUI build with model wrappers.")
+            add_wrapper(
+                KREA2_DIFFUSION_MODEL_WRAPPER_TYPE,
+                Krea2TextResidualWrapper.WRAPPER_KEY,
+                Krea2TextResidualWrapper(config, selected),
+            )
+        else:
+            patched.set_model_attn1_patch(Krea2AttentionPatch(config, selected, modulation_target))
         summary = (
             f"krea2_sparse preset={block_preset}; mapped_blocks_1based=[{_fmt_ints(indices)}]; "
-            f"model_total_blocks={total}; attention_target={attention_target}; "
+            f"model_total_blocks={total}; modulation_target={modulation_target}; "
             f"strength={config.strength:.3f}; normalized_sigma_window=[{config.sigma_start:.3f}, {config.sigma_end:.3f}]; "
             f"ramp={config.sigma_ramp:.3f}; token_weight_mode={config.token_weight_mode}; "
             f"token_tail={config.token_tail:.3f}; cond_only={str(config.cond_only).lower()}; "
-            f"scope=text_attention_{attention_target}; paper_validation=none"
+            f"scope=text_{modulation_target}; paper_validation=none"
         )
         print(f"[ComfyUI-DiffAid-Patches] {summary}")
         return patched, summary

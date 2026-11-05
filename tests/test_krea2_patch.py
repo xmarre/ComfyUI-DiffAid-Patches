@@ -41,6 +41,10 @@ class FakeModel:
     def set_model_unet_function_wrapper(self, wrapper):
         self.model_options["model_function_wrapper"] = wrapper
 
+    def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+        wrappers = self.model_options.setdefault("wrappers", {})
+        wrappers.setdefault(wrapper_type, {}).setdefault(key, []).append(wrapper)
+
     def set_model_attn1_patch(self, patch):
         transformer_options = self.model_options.setdefault("transformer_options", {})
         transformer_options.setdefault("patches", {}).setdefault("attn1_patch", []).append(patch)
@@ -66,7 +70,7 @@ def patch_model(model=None, **overrides):
         block_preset="uniform_five_experimental",
         block_indices="1,8,15,22,28",
         strength=0.2,
-        attention_target="keys_and_values",
+        modulation_target="keys_and_values",
         sigma_start=0.0,
         sigma_end=1.0,
         sigma_ramp=0.0,
@@ -141,7 +145,7 @@ def test_preset_remaps_for_nonstandard_count_and_custom_indices():
     ({"block_preset": "custom_block_indices", "block_indices": "0"}, "1-based"),
     ({"block_preset": "missing"}, "Unknown Krea 2 block preset"),
     ({"sigma_start": 0.7, "sigma_end": 0.3}, "sigma_start"),
-    ({"attention_target": "bad"}, "attention target"),
+    ({"modulation_target": "bad"}, "modulation target"),
 ])
 def test_invalid_configuration_rejected(changes, pattern):
     with pytest.raises(ValueError, match=pattern):
@@ -246,7 +250,7 @@ def test_cache_fingerprint_tracks_effective_changes_only():
     check = nodes.Krea2DiffAidSparsePatchNode.IS_CHANGED
     default = check()
     assert default == check(block_indices="2,9")
-    assert default != check(attention_target="values_only")
+    assert default != check(modulation_target="values_only")
     assert default != check(strength=0.2)
     assert check(block_preset="custom_block_indices", block_indices="1,2") == check(
         block_preset="custom_block_indices", block_indices="1, 2, 2",
@@ -298,3 +302,98 @@ def test_upstream_style_gqa_dispatch_values_only_and_keys_and_values():
     fusion_opts = {k_: v_ for k_, v_ in opts.items() if k_ not in ("block_index", "block_type")}
     out, _ = _krea2_attention_like_upstream(q, k, v, [both], fusion_opts)
     torch.testing.assert_close(out, reference)
+
+
+class _RecordingBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inputs = []
+
+    def forward(self, x, vec, freqs, mask=None, timestep_zero_index=None, transformer_options={}):
+        self.inputs.append(x.clone())
+        return x + 1.0
+
+
+class _FakeKrea2DiT(torch.nn.Module):
+    """Mirrors the native Krea 2 block loop's call convention and options."""
+
+    def __init__(self, blocks=4):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(_RecordingBlock() for _ in range(blocks))
+
+    def run(self, combined, txtlen, transformer_options):
+        transformer_options = dict(transformer_options)
+        transformer_options["block_type"] = "single"
+        transformer_options["img_slice"] = [txtlen, combined.shape[1]]
+        for i, block in enumerate(self.blocks):
+            transformer_options["block_index"] = i
+            combined = block(combined, None, None, None, timestep_zero_index=None,
+                             transformer_options=transformer_options)
+        return combined
+
+
+class _Executor:
+    def __init__(self, dit):
+        self.class_obj = dit
+
+    def __call__(self, *args, **kwargs):
+        return self.class_obj.run(*args, **kwargs)
+
+
+def test_default_target_installs_text_residual_wrapper_not_attention_patch():
+    patched, summary = nodes.Krea2DiffAidSparsePatchNode().patch(
+        FakeModel(), True, "uniform_five_experimental", "", 0.15, "text_residual",
+        0.0, 1.0, 0.0, "none", 0.35, True,
+    )
+    assert "attn1_patch" not in patched.model_options["transformer_options"].get("patches", {})
+    wrappers = patched.model_options["wrappers"]["diffusion_model"][nodes.Krea2TextResidualWrapper.WRAPPER_KEY]
+    assert len(wrappers) == 1 and wrappers[0].selected_blocks == (0, 7, 14, 21, 27)
+    assert "modulation_target=text_residual" in summary
+    defaults = nodes.Krea2DiffAidSparsePatchNode.INPUT_TYPES()["required"]["modulation_target"]
+    assert defaults[1]["default"] == "text_residual"
+
+
+def test_text_residual_scales_only_selected_block_text_prefix_and_removes_hooks():
+    dit = _FakeKrea2DiT()
+    wrapper = nodes.Krea2TextResidualWrapper(config(strength=0.5), [1])
+    x = torch.randn(2, 5, 3)
+    opts = {"cond_or_uncond": [0, 1], "normalized_sigma": 1.0}
+    out = wrapper(_Executor(dit), x, 2, opts)
+
+    torch.testing.assert_close(dit.blocks[0].inputs[0], x)
+    into_selected = dit.blocks[1].inputs[0]
+    expected = x + 1.0
+    torch.testing.assert_close(into_selected[0, :2], expected[0, :2] * 1.5)  # cond row, text
+    torch.testing.assert_close(into_selected[0, 2:], expected[0, 2:])  # cond row, image
+    torch.testing.assert_close(into_selected[1], expected[1])  # uncond row
+    assert all(len(b._forward_pre_hooks) == 0 for b in dit.blocks)
+
+    reference = _FakeKrea2DiT().run(x, 2, opts)
+    torch.testing.assert_close(out[:, 2:], reference[:, 2:])
+    torch.testing.assert_close(out[1], reference[1])
+
+
+def test_text_residual_hooks_removed_on_error_and_bounds_checked():
+    dit = _FakeKrea2DiT()
+    wrapper = nodes.Krea2TextResidualWrapper(config(), [0])
+
+    class Failing(_Executor):
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        wrapper(Failing(dit), torch.zeros(1, 3, 2), 1, {})
+    assert all(len(b._forward_pre_hooks) == 0 for b in dit.blocks)
+    assert wrapper._active is False
+    with pytest.raises(ValueError, match="exceed"):
+        nodes.Krea2TextResidualWrapper(config(), [4])(_Executor(dit), torch.zeros(1, 3, 2), 1, {})
+
+
+def test_text_residual_zero_text_prefix_and_sigma_window_are_identity():
+    dit = _FakeKrea2DiT()
+    x = torch.randn(1, 4, 3)
+    out = nodes.Krea2TextResidualWrapper(config(), [0, 2])(_Executor(dit), x, 0, {})
+    torch.testing.assert_close(out, _FakeKrea2DiT().run(x, 0, {}))
+    windowed = nodes.Krea2TextResidualWrapper(config(sigma_start=0.0, sigma_end=0.5), [0, 2])
+    out = windowed(_Executor(_FakeKrea2DiT()), x, 2, {"normalized_sigma": 0.9})
+    torch.testing.assert_close(out, _FakeKrea2DiT().run(x, 2, {}))
