@@ -125,7 +125,7 @@ In this codebase:
 So the correct description is:
 
 - **paper**: trained adaptive block/timestep/token modulation
-- **this repo**: practical inference-time modulation inspired by that idea, with a closer approximation for FLUX sparse enhancement and experimental architecture-specific ports for MiniMax H3, WAN, and SDXL
+- **this repo**: practical inference-time modulation inspired by that idea, with a closer approximation for FLUX sparse enhancement and experimental architecture-specific ports for MiniMax H3, WAN, SDXL, and Krea 2
 
 ---
 
@@ -138,6 +138,12 @@ Those architectures are not interchangeable in ComfyUI integration terms.
 ### Flux-family node
 
 Flux-family models expose transformer block structure that can be patched directly through ComfyUI’s DiT replacement hooks. That makes a sparse block-selection implementation reasonable.
+
+### Krea 2 node
+
+Krea 2 uses a 28-block single-stream DiT with 12-layer Qwen3-VL text fusion and grouped-query attention. Its native ComfyUI block loop **does not** dispatch the Flux/WAN `patches_replace["dit"]` hooks. The default `text_residual` mode therefore uses a diffusion-model wrapper that scales the **text-prefix rows of the residual stream entering selected blocks** — the same operation the Flux node applies in single-stream blocks. Two optional attention-level modes (`values_only`, `keys_and_values`) scale text key/value tensors through `attn1_patch` instead. No mode modifies image/reference tokens directly or the separate text-fusion transformer.
+
+This is not learned text-embedding modulation or an empirically validated Krea block selection. RAW and Turbo use the same hooks; different guidance/sampling settings remain the responsibility of the workflow.
 
 ### WAN node
 
@@ -542,9 +548,39 @@ SDXL model -> SDXL Diff-Aid Cross-Attention Patch -> sampler
 
 ---
 
+## Node 5: Krea 2 Diff-Aid Sparse Attention Patch
+
+**Type:** `MODEL -> MODEL, STRING`
+
+Use with native ComfyUI Krea 2 RAW or Turbo checkpoints, after loading the diffusion model and before the sampler. The text encoder must be loaded as **Krea 2** (12 Qwen3-VL-4B layer taps, not a generic Qwen-Image/Flux encoder). Incorrect conditioning remains an upstream loader error; this patch does not re-encode prompts.
+
+ComfyUI Krea 2 joins **text tokens first**, then target image and optional reference-image tokens, in its single-stream DiT; `img_slice[0]` identifies the text boundary.
+
+- `modulation_target = text_residual` (default): a `diffusion_model` wrapper registers temporary forward pre-hooks on the selected blocks for each model call and removes them afterwards (also on errors). Each hook replaces the text-prefix rows of the block input with `x_text * (1 + α)`. Module weights and structure are never replaced, so weight patches/LoRAs are unaffected. Every Krea 2 block starts with a per-token RMSNorm, so this changes the balance between the text residual and later block updates instead of rescaling attention inputs directly. This matches the Flux node's single-stream behavior, so strength values are comparable.
+- `modulation_target = values_only` / `keys_and_values`: one `set_model_attn1_patch` callback scales text-prefix **values** (and **keys**) after QK normalization and before RoPE/GQA replication. These modes bypass the block normalization and are much stronger at the same strength: scaling keys multiplies every text-column attention logit by `1 + α`, which acts as a temperature change on text attention and can collapse composition. Use only small strengths (≈0.05–0.15) when comparing them.
+
+- `block_preset = uniform_five_experimental`: 1-based blocks **1, 8, 15, 22, 28** on standard 28-block Krea 2; remapped proportionally if block count differs. These positions are *not* derived from a Krea 2 ablation.
+- `block_preset = custom_block_indices`: explicit 1-based comma-separated indices in the detected block range.
+- `strength = 0.15` by default; `0` returns the untouched model, as does `enabled = False`.
+- `sigma_start = 0.0`, `sigma_end = 1.0`, `sigma_ramp = 0.0`: full normalized noise range, with optional shorter/smoothed windows.
+- `token_weight_mode = none | linear | exponential`; `token_tail` controls decay for non-`none` choices.
+- `cond_only = True`: leave unconditional rows unchanged when ComfyUI provides `cond_or_uncond` metadata.
+
+```text
+Load Diffusion Model (Krea 2 RAW or Turbo)
+ -> Krea 2 Diff-Aid Sparse Attention Patch
+ -> sampler / guider
+```
+
+Start with the defaults for **compatibility testing**, then compare identical prompts/seeds/settings with the node enabled and disabled. Run separate A/B sets on RAW (e.g., its typical 28-step guided workflow) and Turbo (typically 8 distilled steps with CFG off). Compare prompt adherence, composition/identity fidelity, oversharpening, repeated details, artifacts, and throughput. No Krea 2 quality improvement is claimed until empirical tests establish it.
+
+**Implementation difference:** the full Diff-Aid paper learns per-token modulation of text features. `text_residual` applies the repo's heuristic `α` to text features entering selected blocks; the attention modes instead apply `K'_text = K_text * (1 + α)` and/or `V'_text = V_text * (1 + α)`. None of the modes is equivalent to the paper's learned model.
+
+---
+
 ## How the modulation works in this repo
 
-All nodes use the same runtime modulation family:
+All nodes share the same runtime coefficient `α`. The Flux/WAN/H3/SDXL nodes and Krea 2 `text_residual` modulate text features; the Krea 2 attention modes apply the coefficient to text key/value tensors instead:
 
 ```text
 α = strength × time_gain × branch_gain × token_gain
@@ -556,7 +592,7 @@ where:
 - `time_gain` comes from the normalized sigma-level window
 - `branch_gain` is `1` for conditional rows and `0` for unconditional rows when `cond_only = True` and ComfyUI exposes an unambiguous `cond_or_uncond` layout
 - `token_gain` comes from the selected token weighting mode
-- the resulting `α` is broadcast over token embeddings
+- the resulting `α` is broadcast over eligible text-token features (or, for the Krea 2 attention modes, text-prefix attention keys/values)
 
 ### Normalized sigma window
 
@@ -584,6 +620,12 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 - the model is Flux-family
 - the loaded diffusion model exposes `double_blocks` and `single_blocks`
 
+### Use the Krea 2 node when
+
+- the model is native ComfyUI Krea 2 (RAW or Turbo), with 12-layer Qwen3-VL text fusion
+- the diffusion model runs through ComfyUI's `diffusion_model` wrappers and exposes `img_slice` (plus `attn1_patch` for the attention modes)
+- the workflow uses the matching Krea 2 text encoder and VAE
+
 ### Use the WAN node when
 
 - the model is a native ComfyUI WAN-family model
@@ -604,8 +646,9 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 
 ### Do not expect
 
-- the Flux node to work on SDXL or WAN
+- the Flux node to work on SDXL, WAN, or Krea 2
 - the WAN node to work on Kijai/WanVideoWrapper internals unless they expose the same native `blocks`/`patches_replace` path
+- the Krea 2 node to reproduce paper-exact conditioning or paper-validated Krea 2 results
 - the MiniMax H3 node to reproduce trained Diff-Aid or paper-validated H3 results
 - the SDXL node to behave like the paper’s SD 3.5 implementation
 - any node to reproduce the paper’s trained Aid results exactly
@@ -620,8 +663,8 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 2. **No trained Aid weights included**
    There is no shipped checkpoint corresponding to the paper.
 
-3. **FLUX approximation is closer than MiniMax H3, WAN, or SDXL**
-   The Flux sparse patch is directly motivated by the paper’s appendix sparse-enhancement result. The MiniMax H3, WAN, and SDXL nodes are experimental architectural ports.
+3. **FLUX approximation is closer than MiniMax H3, WAN, SDXL, or Krea 2**
+   The Flux sparse patch is directly motivated by the paper’s appendix sparse-enhancement result. The MiniMax H3, WAN, SDXL, and Krea 2 nodes are experimental architectural ports.
 
 4. **WAN is an experimental text-conditioning port**
    WAN support uses the native WAN block hook where available, but the paper does not evaluate text-to-video models.
@@ -632,10 +675,13 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 6. **Single-stream Flux behavior is more sensitive**
    That is why it is disabled by default in the sparse preset path.
 
-7. **Results will be model- and workflow-dependent**
+7. **Krea 2 modulation is unvalidated**
+   The default blocks and strength are exploratory; both RAW and Turbo require paired visual testing before quality claims. The attention modes (`values_only`, `keys_and_values`) are far stronger than `text_residual` at equal strength and can destroy composition at Flux-typical strengths such as 0.5.
+
+8. **Results will be model- and workflow-dependent**
    Especially for non-canonical Flux.2 variants, MiniMax H3 audio-video modes, WAN 2.1 / 2.2 video workflows, and SDXL workflows with additional model patches or LoRAs.
 
-8. **The exact minimum supported ComfyUI version has not been pinned**
+9. **The exact minimum supported ComfyUI version has not been pinned**
    This node pack requires a ComfyUI build with model patch replacement hooks, attention patch hooks, and model function wrappers.
 
 ---
@@ -646,6 +692,7 @@ This was chosen to preserve the paper’s token-importance intuition in a simple
 - Keep **single-stream patching off** unless you are deliberately testing it.
 - Keep `cond_only = True` unless you intentionally want to modulate unconditional/negative-conditioning rows too.
 - For MiniMax H3, start with low strength and compare the full validation matrix with fixed generation settings.
+- For Krea 2, start with `text_residual` at **0.15 strength**, then raise it towards Flux-typical values; verify RAW and Turbo separately. Keep the attention modes at small strengths.
 - For WAN, start with **moderate strength** and verify motion/detail stability before increasing it.
 - For SDXL, start with **low strength** and broaden only if the effect is too weak.
 - Treat this repo as an **experimental inference-time patch pack**, not as a claim of reproducing the paper’s published numbers.
