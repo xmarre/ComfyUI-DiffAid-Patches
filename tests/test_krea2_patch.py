@@ -254,3 +254,47 @@ def test_cache_fingerprint_tracks_effective_changes_only():
     assert check(block_preset="custom_block_indices", block_indices="1,2") != check(
         block_preset="custom_block_indices", block_indices="1,3",
     )
+
+
+def _krea2_attention_like_upstream(q, k, v, patches, extra_options):
+    """Mirror of ComfyUI comfy/ldm/krea2/model.py Attention.forward patch dispatch.
+
+    attn1_patch runs after QK normalization and before RoPE / GQA key-value
+    repetition. Text RoPE positions are all zero (identity rotation), so RoPE
+    is omitted here; it does not change the text-prefix result.
+    """
+    if "block_index" in extra_options:
+        for p in patches:
+            out = p(q, k, v, pe=None, attn_mask=None, extra_options=extra_options.copy())
+            q, k, v = out.get("q", q), out.get("k", k), out.get("v", v)
+    rep = q.shape[1] // k.shape[1]
+    k = k.repeat_interleave(rep, dim=1)
+    v = v.repeat_interleave(rep, dim=1)
+    probs = torch.softmax(q @ k.transpose(-1, -2) / q.shape[-1] ** 0.5, dim=-1)
+    return probs @ v, probs
+
+
+def test_upstream_style_gqa_dispatch_values_only_and_keys_and_values():
+    torch.manual_seed(0)
+    q = torch.randn(1, 4, 7, 8)
+    k = torch.randn(1, 2, 7, 8)
+    v = torch.randn(1, 2, 7, 8)
+    opts = {"block_type": "single", "block_index": 5, "img_slice": [3, 7], "normalized_sigma": 1.0}
+    reference, ref_probs = _krea2_attention_like_upstream(q, k, v, [], opts)
+
+    values_only = nodes.Krea2AttentionPatch(config(strength=0.2), [5], "values_only")
+    out, probs = _krea2_attention_like_upstream(q, k, v, [values_only], opts)
+    torch.testing.assert_close(probs, ref_probs)
+    v_text = v[:, :, :3].repeat_interleave(2, dim=1)
+    torch.testing.assert_close(out - reference, ref_probs[..., :3] @ (0.2 * v_text))
+
+    both = nodes.Krea2AttentionPatch(config(strength=0.2), [5], "keys_and_values")
+    _, probs = _krea2_attention_like_upstream(q, k, v, [both], opts)
+    logits = q @ k.repeat_interleave(2, dim=1).transpose(-1, -2) / 8 ** 0.5
+    logits[..., :3] = logits[..., :3] * 1.2
+    torch.testing.assert_close(probs, torch.softmax(logits, dim=-1))
+
+    # Text-fusion attention runs before the DiT loop sets block_index.
+    fusion_opts = {k_: v_ for k_, v_ in opts.items() if k_ not in ("block_index", "block_type")}
+    out, _ = _krea2_attention_like_upstream(q, k, v, [both], fusion_opts)
+    torch.testing.assert_close(out, reference)
