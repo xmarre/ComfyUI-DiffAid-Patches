@@ -821,6 +821,8 @@ class Krea2TextResidualWrapper:
         self.config = config
         self.selected_blocks = tuple(sorted(set(int(i) for i in selected_blocks)))
         self._active = False
+        self._applied_calls = 0
+        self._reported = False
 
     def __call__(self, executor, *args, **kwargs):
         if self._active:
@@ -833,14 +835,36 @@ class Krea2TextResidualWrapper:
             raise ValueError(f"Krea 2 block indices exceed the model's {len(blocks)} blocks.")
         handles = []
         self._active = True
+        self._applied_calls = 0
         try:
             for index in self.selected_blocks:
                 handles.append(blocks[index].register_forward_pre_hook(self._pre_hook, with_kwargs=True))
-            return executor(*args, **kwargs)
+            result = executor(*args, **kwargs)
         finally:
             for handle in handles:
                 handle.remove()
             self._active = False
+        self._report_once()
+        return result
+
+    def _report_once(self):
+        # One line per node configuration: confirms in the console whether the
+        # modulation really reached the selected Krea 2 blocks.
+        if self._reported:
+            return
+        self._reported = True
+        blocks = _fmt_ints([index + 1 for index in self.selected_blocks])
+        if self._applied_calls > 0:
+            print(
+                f"[ComfyUI-DiffAid-Patches] Krea 2 text_residual applied: {self._applied_calls} selected block "
+                f"call(s) modulated in the first model call (blocks_1based=[{blocks}])."
+            )
+        else:
+            print(
+                "[ComfyUI-DiffAid-Patches] WARNING: Krea 2 text_residual hooks did not run in the first model "
+                f"call (blocks_1based=[{blocks}]); no modulation was applied there. A compiled or replaced "
+                "diffusion model can bypass block hooks."
+            )
 
     def _pre_hook(self, module, args, kwargs):
         options = kwargs.get("transformer_options") or {}
@@ -859,6 +883,7 @@ class Krea2TextResidualWrapper:
             raise ValueError("Krea 2 text-token prefix exceeds the block input sequence length.")
         prefix = x[:, :text_length, :]
         alpha = _compute_alpha(prefix, text_length, self.config, options)
+        self._applied_calls += 1
         new_x = torch.cat((prefix + prefix * alpha, x[:, text_length:, :]), dim=1)
         return (new_x, *args[1:]), kwargs
 

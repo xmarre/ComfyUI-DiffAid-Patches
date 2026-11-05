@@ -397,3 +397,19 @@ def test_text_residual_zero_text_prefix_and_sigma_window_are_identity():
     windowed = nodes.Krea2TextResidualWrapper(config(sigma_start=0.0, sigma_end=0.5), [0, 2])
     out = windowed(_Executor(_FakeKrea2DiT()), x, 2, {"normalized_sigma": 0.9})
     torch.testing.assert_close(out, _FakeKrea2DiT().run(x, 2, {}))
+
+
+def test_text_residual_reports_once_whether_hooks_ran(capsys):
+    wrapper = nodes.Krea2TextResidualWrapper(config(), [1])
+    x = torch.randn(1, 4, 3)
+    wrapper(_Executor(_FakeKrea2DiT()), x, 2, {})
+    wrapper(_Executor(_FakeKrea2DiT()), x, 2, {})
+    out = capsys.readouterr().out
+    assert out.count("text_residual applied: 1 selected block call(s)") == 1
+
+    class Bypassing(_Executor):
+        def __call__(self, *args, **kwargs):
+            return args[0]
+
+    nodes.Krea2TextResidualWrapper(config(), [1])(Bypassing(_FakeKrea2DiT()), x, 2, {})
+    assert "hooks did not run" in capsys.readouterr().out
