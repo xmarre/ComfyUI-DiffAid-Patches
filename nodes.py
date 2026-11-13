@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -538,6 +539,62 @@ def _get_minimax_h3_block_count(model) -> Tuple[int, Optional[str]]:
     return total, inner_name
 
 
+KREA2_EXPERIMENTAL_BLOCKS: Tuple[int, ...] = (1, 8, 15, 22, 28)
+# comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL; kept literal so the
+# node module imports without ComfyUI (unit tests).
+KREA2_DIFFUSION_MODEL_WRAPPER_TYPE = "diffusion_model"
+KREA2_MODULATION_TARGETS: Tuple[str, ...] = ("text_residual", "values_only", "keys_and_values")
+# What normalized sigma 1.0 means for the Krea 2 sigma window.
+KREA2_SIGMA_REFERENCES: Tuple[str, ...] = ("schedule_start", "model_sigma_max")
+
+
+def _model_sigma_max(model) -> float:
+    """Largest sigma of the model's own noise schedule (1.0 for flow models)."""
+    try:
+        value = float(model.get_model_object("model_sampling").sigma_max)
+    except Exception as exc:
+        raise ValueError("sigma_reference=model_sigma_max requires the model's sampling schedule.") from exc
+    if not math.isfinite(value) or value <= _EPSILON:
+        raise ValueError("sigma_reference=model_sigma_max requires a finite, positive model sigma_max.")
+    return value
+
+
+def _get_krea2_block_count(model) -> int:
+    try:
+        inner = model.get_model_object("diffusion_model")
+    except Exception as exc:
+        raise ValueError("This node requires a native ComfyUI Krea 2 MODEL.") from exc
+
+    # Compiled/quantized models can expose the native model through a wrapper.
+    seen = set()
+    for _ in range(8):
+        if id(inner) in seen:
+            break
+        seen.add(id(inner))
+        if all(
+            hasattr(inner, attr)
+            for attr in ("blocks", "txtfusion", "txtmlp", "pe_embedder", "first", "process_img", "_unpack_context")
+        ):
+            if getattr(inner, "txtlayers", None) != 12:
+                raise ValueError("Krea 2 requires its 12-layer Qwen3-VL text-fusion architecture.")
+            try:
+                count = len(inner.blocks)
+            except (TypeError, AttributeError) as exc:
+                raise ValueError("Krea 2 does not expose a valid transformer blocks list.") from exc
+            if count <= 0:
+                raise ValueError("Krea 2 does not expose any transformer blocks.")
+            return count
+        children = list(_iter_wrapper_children(inner))
+        if not children:
+            break
+        inner = children[0][1]
+
+    raise ValueError(
+        "This node requires native ComfyUI Krea 2 (SingleStreamDiT with 12-layer text fusion), "
+        "not a Flux, WAN, or generic DiT model."
+    )
+
+
 def _get_flux_block_counts(model) -> Tuple[int, int]:
     diffusion_model = model.get_model_object("diffusion_model")
     return len(diffusion_model.double_blocks), len(diffusion_model.single_blocks)
@@ -599,9 +656,17 @@ def _map_combined_indices_to_flux_stages(indices_1based: Sequence[int], total_do
 
 
 class SharedTimestepWrapper(nn.Module):
-    def __init__(self, existing_wrapper=None):
+    def __init__(self, existing_wrapper=None, reference_sigma: Optional[float] = None):
         super().__init__()
         self.existing_wrapper = existing_wrapper
+        # None: normalize against the first sigma of the current sampler call.
+        # A positive value: normalize against that fixed sigma instead, so the
+        # window addresses absolute noise levels in every sampler call.
+        if reference_sigma is not None:
+            reference_sigma = float(reference_sigma)
+            if not math.isfinite(reference_sigma) or reference_sigma <= _EPSILON:
+                raise ValueError("Diff-Aid reference sigma must be finite and positive.")
+        self.reference_sigma = reference_sigma
         self._first_sigma_abs: Optional[float] = None
         self._last_sigma_abs: Optional[float] = None
 
@@ -620,6 +685,13 @@ class SharedTimestepWrapper(nn.Module):
         t = _as_float_tensor(timestep, device=device)
         if t is None or t.numel() == 0:
             return torch.tensor([1.0], device=device, dtype=torch.float32)
+
+        if self.reference_sigma is not None:
+            # Independent of the schedule of the current sampler call and of
+            # earlier calls; the recorded pair mirrors the other branches.
+            self._first_sigma_abs = self.reference_sigma
+            self._last_sigma_abs = float(t.abs().max().item())
+            return (t.abs() / self.reference_sigma).clamp(0.0, 1.0)
 
         transformer_options = transformer_options or {}
         scheduled_first_sigma = _max_abs_positive(transformer_options.get("sample_sigmas", None), device=device)
@@ -710,6 +782,139 @@ class FluxBlockReplacePatch(nn.Module):
         prefix = x[:, :txt_len, :] + x[:, :txt_len, :] * alpha
         new_args["img"] = torch.cat((prefix, x[:, txt_len:, :]), dim=1)
         return self._call_next(new_args, extra)
+
+
+class Krea2AttentionPatch(nn.Module):
+    """Krea 2's native attn1 hook: scale text K/V after QK normalization.
+
+    The Krea 2 block loop does not dispatch DiT block-replacement patches.
+    Its attention hook runs after Q/K/V projection, with text tokens as the
+    prefix of the combined sequence. Queries and all image/reference rows
+    remain unchanged; the GQA key/value head count is independent of queries.
+    """
+
+    def __init__(self, config: SharedConfig, selected_blocks: Sequence[int], attention_target: str):
+        super().__init__()
+        self.config = config
+        self.selected_blocks = frozenset(selected_blocks)
+        if attention_target not in {"keys_and_values", "values_only"}:
+            raise ValueError(f"Unsupported Krea 2 attention target: {attention_target}.")
+        self.attention_target = attention_target
+
+    def forward(self, q, k, v, *, pe=None, attn_mask=None, extra_options=None):
+        options = extra_options or {}
+        # The pre-DiT text-fusion layers also use Attention; they do not
+        # carry a DiT block_index and must never be changed.
+        if options.get("block_type") != "single" or options.get("block_index") not in self.selected_blocks:
+            return {}
+
+        image_slice = options.get("img_slice")
+        if not isinstance(image_slice, (tuple, list)) or len(image_slice) != 2:
+            raise ValueError("Krea 2 attention patch requires native img_slice text-prefix metadata.")
+        text_length = int(image_slice[0])
+        if text_length < 0:
+            raise ValueError("Krea 2 text-token count cannot be negative.")
+        if text_length == 0:
+            return {}
+        if k.ndim != 4 or v.ndim != 4 or k.shape != v.shape:
+            raise ValueError("Krea 2 attention patch expects matching [B, KV_heads, tokens, head_dim] K/V.")
+        if text_length > k.shape[2]:
+            raise ValueError("Krea 2 text-token prefix exceeds attention sequence length.")
+
+        alpha = _compute_alpha(k[:, :, :text_length, :], text_length, self.config, options)
+        gain = 1.0 + alpha.unsqueeze(1)
+        # No in-place mutation: preserve tensor ownership and compatibility
+        # with earlier/later attention patches in ComfyUI's patch list.
+        result = {
+            "v": torch.cat((v[:, :, :text_length, :] * gain, v[:, :, text_length:, :]), dim=2)
+        }
+        if self.attention_target == "keys_and_values":
+            result["k"] = torch.cat((k[:, :, :text_length, :] * gain, k[:, :, text_length:, :]), dim=2)
+        return result
+
+
+class Krea2TextResidualWrapper:
+    """Diffusion-model wrapper that scales the text prefix of selected Krea 2 block inputs.
+
+    This is the Krea 2 counterpart of the Flux single-stream patch: text rows of
+    the shared residual stream are scaled by ``1 + alpha`` immediately before a
+    selected block. Krea 2 does not dispatch DiT block-replacement patches, so
+    temporary forward pre-hooks are registered on the selected blocks for the
+    duration of one diffusion-model call and always removed afterwards. Module
+    weights and structure are never replaced.
+    """
+
+    WRAPPER_KEY = "diffaid_krea2_text_residual"
+
+    def __init__(self, config: SharedConfig, selected_blocks: Sequence[int]):
+        self.config = config
+        self.selected_blocks = tuple(sorted(set(int(i) for i in selected_blocks)))
+        self._active = False
+        self._applied_calls = 0
+        self._reported = False
+
+    def __call__(self, executor, *args, **kwargs):
+        if self._active:
+            # Re-entrant call of the same diffusion model: hooks are already installed.
+            return executor(*args, **kwargs)
+        blocks = getattr(getattr(executor, "class_obj", None), "blocks", None)
+        if blocks is None:
+            raise ValueError("Krea 2 text-residual modulation requires the native diffusion model blocks list.")
+        if self.selected_blocks and self.selected_blocks[-1] >= len(blocks):
+            raise ValueError(f"Krea 2 block indices exceed the model's {len(blocks)} blocks.")
+        handles = []
+        self._active = True
+        self._applied_calls = 0
+        try:
+            for index in self.selected_blocks:
+                handles.append(blocks[index].register_forward_pre_hook(self._pre_hook, with_kwargs=True))
+            result = executor(*args, **kwargs)
+        finally:
+            for handle in handles:
+                handle.remove()
+            self._active = False
+        self._report_once()
+        return result
+
+    def _report_once(self):
+        # One line per node configuration: confirms in the console whether the
+        # modulation really reached the selected Krea 2 blocks.
+        if self._reported:
+            return
+        self._reported = True
+        blocks = _fmt_ints([index + 1 for index in self.selected_blocks])
+        if self._applied_calls > 0:
+            print(
+                f"[ComfyUI-DiffAid-Patches] Krea 2 text_residual applied: {self._applied_calls} selected block "
+                f"call(s) modulated in the first model call (blocks_1based=[{blocks}])."
+            )
+        else:
+            print(
+                "[ComfyUI-DiffAid-Patches] WARNING: Krea 2 text_residual hooks did not run in the first model "
+                f"call (blocks_1based=[{blocks}]); no modulation was applied there. A compiled or replaced "
+                "diffusion model can bypass block hooks."
+            )
+
+    def _pre_hook(self, module, args, kwargs):
+        options = kwargs.get("transformer_options") or {}
+        if not args:
+            raise ValueError("Krea 2 block was called without its hidden-state input.")
+        x = args[0]
+        image_slice = options.get("img_slice")
+        if not isinstance(image_slice, (tuple, list)) or len(image_slice) != 2:
+            raise ValueError("Krea 2 text-residual modulation requires native img_slice text-prefix metadata.")
+        text_length = int(image_slice[0])
+        if text_length < 0:
+            raise ValueError("Krea 2 text-token count cannot be negative.")
+        if text_length == 0:
+            return None
+        if x.ndim != 3 or text_length > x.shape[1]:
+            raise ValueError("Krea 2 text-token prefix exceeds the block input sequence length.")
+        prefix = x[:, :text_length, :]
+        alpha = _compute_alpha(prefix, text_length, self.config, options)
+        self._applied_calls += 1
+        new_x = torch.cat((prefix + prefix * alpha, x[:, text_length:, :]), dim=1)
+        return (new_x, *args[1:]), kwargs
 
 
 class WanBlockReplacePatch(nn.Module):
@@ -1154,6 +1359,167 @@ class Flux2DiffAidSparsePatchNode:
         return patched, summary
 
 
+class Krea2DiffAidSparsePatchNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "enabled": ("BOOLEAN", {"default": True}),
+                "block_preset": (
+                    ["uniform_five_experimental", "custom_block_indices"],
+                    {"default": "uniform_five_experimental"},
+                ),
+                "block_indices": ("STRING", {"default": "1,8,15,22,28", "multiline": False, "advanced": True}),
+                "strength": ("FLOAT", {"default": 0.15, "min": -1.0, "max": 1.0, "step": 0.01}),
+                "modulation_target": (
+                    list(KREA2_MODULATION_TARGETS), {"default": "text_residual"}
+                ),
+                "sigma_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "sigma_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "sigma_ramp": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.5, "step": 0.001, "advanced": True}),
+                "token_weight_mode": (["none", "linear", "exponential"], {"default": "none"}),
+                "token_tail": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01, "advanced": True}),
+                "cond_only": ("BOOLEAN", {"default": True, "advanced": True}),
+            },
+            "optional": {
+                "sigma_reference": (
+                    list(KREA2_SIGMA_REFERENCES),
+                    {
+                        "default": "schedule_start",
+                        "advanced": True,
+                        "tooltip": (
+                            "What normalized sigma 1.0 means for sigma_start/sigma_end. "
+                            "schedule_start: the first sigma of the current sampler call, so a partial-denoise "
+                            "or refinement pass spans the whole window again from 1.0. "
+                            "model_sigma_max: the model's maximum sigma, so the window addresses the same "
+                            "absolute noise levels in every sampler call. Changing this reference changes "
+                            "which steps are modulated and can disable Diff-Aid for an entire low-sigma "
+                            "refinement pass; compare matched seeds before switching."
+                        ),
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "summary")
+    FUNCTION = "patch"
+    CATEGORY = "model_patches/diffaid"
+
+    @staticmethod
+    def IS_CHANGED(
+        model=None,
+        enabled: bool = True,
+        block_preset: str = "uniform_five_experimental",
+        block_indices: str = "1,8,15,22,28",
+        strength: float = 0.15,
+        modulation_target: str = "text_residual",
+        sigma_start: float = 0.0,
+        sigma_end: float = 1.0,
+        sigma_ramp: float = 0.0,
+        token_weight_mode: str = "none",
+        token_tail: float = 0.35,
+        cond_only: bool = True,
+        sigma_reference: str = "schedule_start",
+    ):
+        custom = _cache_str(block_preset) == "custom_block_indices"
+        return (
+            "krea2_sparse",
+            _cache_str(block_preset),
+            _cache_block_indices(block_indices) if custom else "",
+            _cache_str(modulation_target),
+            _cache_str(sigma_reference),
+            *_shared_config_fingerprint(
+                enabled=enabled,
+                strength=strength,
+                sigma_start=sigma_start,
+                sigma_end=sigma_end,
+                sigma_ramp=sigma_ramp,
+                token_weight_mode=token_weight_mode,
+                token_tail=token_tail,
+                cond_only=cond_only,
+            ),
+        )
+
+    def patch(
+        self,
+        model,
+        enabled: bool,
+        block_preset: str,
+        block_indices: str,
+        strength: float,
+        modulation_target: str,
+        sigma_start: float,
+        sigma_end: float,
+        sigma_ramp: float,
+        token_weight_mode: str,
+        token_tail: float,
+        cond_only: bool = True,
+        sigma_reference: str = "schedule_start",
+    ):
+        if not enabled:
+            return model, "disabled"
+        if strength == 0.0:
+            return model, "zero strength (no patch)"
+        if sigma_start > sigma_end:
+            raise ValueError(f"sigma_start ({sigma_start}) must be <= sigma_end ({sigma_end}).")
+        if sigma_reference not in KREA2_SIGMA_REFERENCES:
+            raise ValueError(f"Unsupported Krea 2 sigma reference: {sigma_reference}.")
+        total = _get_krea2_block_count(model)
+        if block_preset == "uniform_five_experimental":
+            indices = _remap_stage_indices(KREA2_EXPERIMENTAL_BLOCKS, 28, total)
+        elif block_preset == "custom_block_indices":
+            indices = _parse_combined_block_indices(block_indices)
+        else:
+            raise ValueError(f"Unknown Krea 2 block preset: {block_preset}.")
+        if any(index > total for index in indices):
+            raise ValueError(f"Krea 2 block indices must be in range 1..{total}.")
+        if modulation_target not in KREA2_MODULATION_TARGETS:
+            raise ValueError(f"Unsupported Krea 2 modulation target: {modulation_target}.")
+        config = SharedConfig(
+            float(strength), float(sigma_start), float(sigma_end), float(sigma_ramp),
+            token_weight_mode, float(token_tail), bool(cond_only),
+        )
+        # The native Krea 2 DiT does not invoke patches_replace["dit"].
+        # text_residual: scale text rows of selected block inputs (Flux
+        # single-stream equivalent) via a diffusion-model wrapper.
+        # values_only / keys_and_values: attn1_patch after per-head QK norm.
+        reference_sigma = _model_sigma_max(model) if sigma_reference == "model_sigma_max" else None
+        patched = model.clone()
+        previous_wrapper = patched.model_options.get("model_function_wrapper")
+        if (isinstance(previous_wrapper, SharedTimestepWrapper)
+                and previous_wrapper.reference_sigma != reference_sigma):
+            # Stacked Diff-Aid patches read one shared normalized sigma.
+            raise ValueError("Stacked Diff-Aid patches on one model must use the same sigma_reference.")
+        patched.set_model_unet_function_wrapper(
+            SharedTimestepWrapper(existing_wrapper=previous_wrapper, reference_sigma=reference_sigma)
+        )
+        selected = [index - 1 for index in indices]
+        if modulation_target == "text_residual":
+            add_wrapper = getattr(patched, "add_wrapper_with_key", None)
+            if not callable(add_wrapper):
+                raise ValueError("Krea 2 text_residual modulation requires a ComfyUI build with model wrappers.")
+            add_wrapper(
+                KREA2_DIFFUSION_MODEL_WRAPPER_TYPE,
+                Krea2TextResidualWrapper.WRAPPER_KEY,
+                Krea2TextResidualWrapper(config, selected),
+            )
+        else:
+            patched.set_model_attn1_patch(Krea2AttentionPatch(config, selected, modulation_target))
+        summary = (
+            f"krea2_sparse preset={block_preset}; mapped_blocks_1based=[{_fmt_ints(indices)}]; "
+            f"model_total_blocks={total}; modulation_target={modulation_target}; "
+            f"strength={config.strength:.3f}; normalized_sigma_window=[{config.sigma_start:.3f}, {config.sigma_end:.3f}]; "
+            f"ramp={config.sigma_ramp:.3f}; sigma_reference={sigma_reference}; "
+            f"token_weight_mode={config.token_weight_mode}; "
+            f"token_tail={config.token_tail:.3f}; cond_only={str(config.cond_only).lower()}; "
+            f"scope=text_{modulation_target}; paper_validation=none"
+        )
+        print(f"[ComfyUI-DiffAid-Patches] {summary}")
+        return patched, summary
+
+
 class WanDiffAidSparsePatchNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1477,6 +1843,7 @@ class SDXLDiffAidCrossAttentionPatchNode:
 
 NODE_CLASS_MAPPINGS = {
     "Flux2DiffAidSparsePatch": Flux2DiffAidSparsePatchNode,
+    "Krea2DiffAidSparsePatch": Krea2DiffAidSparsePatchNode,
     "WanDiffAidSparsePatch": WanDiffAidSparsePatchNode,
     "MiniMaxH3DiffAidSparsePatch": MiniMaxH3DiffAidSparsePatchNode,
     "SDXLDiffAidCrossAttentionPatch": SDXLDiffAidCrossAttentionPatchNode,
@@ -1484,6 +1851,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Flux2DiffAidSparsePatch": "Flux-family Diff-Aid Sparse Patch",
+    "Krea2DiffAidSparsePatch": "Krea 2 Diff-Aid Sparse Attention Patch",
     "WanDiffAidSparsePatch": "WAN Diff-Aid Sparse Patch",
     "MiniMaxH3DiffAidSparsePatch": "MiniMax H3 Diff-Aid Sparse Patch",
     "SDXLDiffAidCrossAttentionPatch": "SDXL Diff-Aid Cross-Attention Patch",
