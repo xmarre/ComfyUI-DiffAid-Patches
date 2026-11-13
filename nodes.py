@@ -1393,7 +1393,9 @@ class Krea2DiffAidSparsePatchNode:
                             "schedule_start: the first sigma of the current sampler call, so a partial-denoise "
                             "or refinement pass spans the whole window again from 1.0. "
                             "model_sigma_max: the model's maximum sigma, so the window addresses the same "
-                            "absolute noise levels in every sampler call."
+                            "absolute noise levels in every sampler call. Changing this reference changes "
+                            "which steps are modulated and can disable Diff-Aid for an entire low-sigma "
+                            "refinement pass; compare matched seeds before switching."
                         ),
                     },
                 ),
