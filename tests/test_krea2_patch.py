@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import types
 
 import pytest
 import torch
@@ -25,18 +26,21 @@ class FakeKrea2:
 
 
 class FakeModel:
-    def __init__(self, inner=None, options=None, counter=None):
+    def __init__(self, inner=None, options=None, counter=None, sigma_max=1.0):
         self.inner = inner or FakeKrea2()
         self.model_options = copy.deepcopy(options if options is not None else {"transformer_options": {}})
         self.counter = counter if counter is not None else {"clones": 0}
+        self.sigma_max = sigma_max
 
     def get_model_object(self, key):
+        if key == "model_sampling":
+            return types.SimpleNamespace(sigma_max=self.sigma_max)
         assert key == "diffusion_model"
         return self.inner
 
     def clone(self):
         self.counter["clones"] += 1
-        return FakeModel(self.inner, self.model_options, self.counter)
+        return FakeModel(self.inner, self.model_options, self.counter, self.sigma_max)
 
     def set_model_unet_function_wrapper(self, wrapper):
         self.model_options["model_function_wrapper"] = wrapper
@@ -413,3 +417,101 @@ def test_text_residual_reports_once_whether_hooks_ran(capsys):
 
     nodes.Krea2TextResidualWrapper(config(), [1])(Bypassing(_FakeKrea2DiT()), x, 2, {})
     assert "hooks did not run" in capsys.readouterr().out
+
+
+# Sigma schedules of a re-noised refinement pass: the trailing steps of a full
+# flow schedule, started well below the model's maximum sigma of 1.0.
+REFINEMENT_SCHEDULES = (
+    (0.55826634, 0.46276948, 0.34492800, 0.19562392, 0.0),
+    (0.58941382, 0.51284409, 0.42156866, 0.31090108, 0.17392661, 0.0),
+)
+
+
+def _window_gains(wrapper, schedule, window):
+    """Sigma-window gain of every model call of one sampler call."""
+    sigmas = torch.tensor(schedule)
+    gains = []
+    for sigma in schedule[:-1]:
+        seen = {}
+
+        def model_function(input_x, timestep, **c):
+            seen.update(c["transformer_options"][nodes.STATE_KEY])
+            return input_x
+
+        wrapper(model_function, {
+            "input": torch.zeros(1), "timestep": torch.tensor([sigma]),
+            "c": {"transformer_options": {"sample_sigmas": sigmas}},
+        })
+        gains.append(float(nodes._sigma_window_gain(seen["normalized_sigma"], *window)))
+    return gains
+
+
+def test_sigma_reference_defaults_to_schedule_start_and_is_optional():
+    inputs = nodes.Krea2DiffAidSparsePatchNode.INPUT_TYPES()
+    assert "sigma_reference" not in inputs["required"]
+    choices, options = inputs["optional"]["sigma_reference"]
+    assert choices == ["schedule_start", "model_sigma_max"] and options["default"] == "schedule_start"
+    patched, summary = patch_model()
+    assert patched.model_options["model_function_wrapper"].reference_sigma is None
+    assert "sigma_reference=schedule_start" in summary
+    explicit, _ = patch_model(sigma_reference="schedule_start")
+    assert explicit.model_options["model_function_wrapper"].reference_sigma is None
+
+
+@pytest.mark.parametrize("schedule", REFINEMENT_SCHEDULES)
+@pytest.mark.parametrize("window, inside", [((0.75, 1.0, 0.0), 0.0), ((0.0, 0.75, 0.0), 1.0)])
+def test_schedule_start_reference_restarts_the_window_in_a_refinement_pass(schedule, window, inside):
+    wrapper = patch_model()[0].model_options["model_function_wrapper"]
+    gains = _window_gains(wrapper, schedule, window)
+    # The pass begins at normalized sigma 1.0 whatever its absolute noise level,
+    # so a window boundary inside (0, 1) is crossed again within the pass.
+    assert gains[0] == 1.0 - inside and gains[-1] == inside
+    assert len(set(gains)) == 2
+
+
+@pytest.mark.parametrize("schedule", REFINEMENT_SCHEDULES)
+@pytest.mark.parametrize("window, expected", [((0.75, 1.0, 0.0), 0.0), ((0.0, 0.75, 0.0), 1.0)])
+def test_model_sigma_max_reference_keeps_absolute_noise_levels(schedule, window, expected):
+    patched, summary = patch_model(sigma_reference="model_sigma_max")
+    wrapper = patched.model_options["model_function_wrapper"]
+    assert wrapper.reference_sigma == 1.0 and "sigma_reference=model_sigma_max" in summary
+    # Every sigma of the pass is below 0.75 of the model maximum: one constant gain.
+    assert _window_gains(wrapper, schedule, window) == [expected] * (len(schedule) - 1)
+    # A full schedule still crosses the same boundary at the same absolute sigma.
+    full = (1.0, 0.9, 0.8, 0.7, 0.6, 0.0)
+    assert _window_gains(wrapper, full, (0.75, 1.0, 0.0)) == [1.0, 1.0, 1.0, 0.0, 0.0]
+    reference = patch_model()[0].model_options["model_function_wrapper"]
+    assert _window_gains(reference, full, (0.75, 1.0, 0.0)) == [1.0, 1.0, 1.0, 0.0, 0.0]
+
+
+def test_model_sigma_max_reference_ignores_schedule_and_previous_calls():
+    wrapper = nodes.SharedTimestepWrapper(reference_sigma=2.0)
+    for sample_sigmas in (None, torch.tensor([0.5, 0.0]), torch.tensor([8.0, 0.0])):
+        options = {} if sample_sigmas is None else {"sample_sigmas": sample_sigmas}
+        value = wrapper._normalized_sigma(torch.tensor([0.5, 3.0]), torch.device("cpu"), options)
+        torch.testing.assert_close(value, torch.tensor([0.25, 1.0]))
+    assert (wrapper._first_sigma_abs, wrapper._last_sigma_abs) == (2.0, 3.0)
+
+
+@pytest.mark.parametrize("sigma_max", [0.0, -1.0, float("nan"), float("inf"), None])
+def test_model_sigma_max_reference_requires_a_valid_model_schedule(sigma_max):
+    with pytest.raises(ValueError, match="model_sigma_max"):
+        patch_model(FakeModel(sigma_max=sigma_max), sigma_reference="model_sigma_max")
+    # The default reference never reads the model schedule.
+    patch_model(FakeModel(sigma_max=sigma_max))
+
+
+def test_sigma_reference_validation_stacking_and_cache_fingerprint():
+    with pytest.raises(ValueError, match="sigma reference"):
+        patch_model(sigma_reference="absolute")
+    with pytest.raises(ValueError, match="finite and positive"):
+        nodes.SharedTimestepWrapper(reference_sigma=0.0)
+    first, _ = patch_model(sigma_reference="model_sigma_max")
+    with pytest.raises(ValueError, match="same sigma_reference"):
+        patch_model(first)
+    stacked, _ = patch_model(first, sigma_reference="model_sigma_max")
+    wrapper = stacked.model_options["model_function_wrapper"]
+    assert wrapper.reference_sigma == 1.0 and wrapper.existing_wrapper.reference_sigma == 1.0
+    check = nodes.Krea2DiffAidSparsePatchNode.IS_CHANGED
+    assert check() == check(sigma_reference="schedule_start")
+    assert check() != check(sigma_reference="model_sigma_max")

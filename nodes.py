@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -543,6 +544,19 @@ KREA2_EXPERIMENTAL_BLOCKS: Tuple[int, ...] = (1, 8, 15, 22, 28)
 # node module imports without ComfyUI (unit tests).
 KREA2_DIFFUSION_MODEL_WRAPPER_TYPE = "diffusion_model"
 KREA2_MODULATION_TARGETS: Tuple[str, ...] = ("text_residual", "values_only", "keys_and_values")
+# What normalized sigma 1.0 means for the Krea 2 sigma window.
+KREA2_SIGMA_REFERENCES: Tuple[str, ...] = ("schedule_start", "model_sigma_max")
+
+
+def _model_sigma_max(model) -> float:
+    """Largest sigma of the model's own noise schedule (1.0 for flow models)."""
+    try:
+        value = float(model.get_model_object("model_sampling").sigma_max)
+    except Exception as exc:
+        raise ValueError("sigma_reference=model_sigma_max requires the model's sampling schedule.") from exc
+    if not math.isfinite(value) or value <= _EPSILON:
+        raise ValueError("sigma_reference=model_sigma_max requires a finite, positive model sigma_max.")
+    return value
 
 
 def _get_krea2_block_count(model) -> int:
@@ -642,9 +656,17 @@ def _map_combined_indices_to_flux_stages(indices_1based: Sequence[int], total_do
 
 
 class SharedTimestepWrapper(nn.Module):
-    def __init__(self, existing_wrapper=None):
+    def __init__(self, existing_wrapper=None, reference_sigma: Optional[float] = None):
         super().__init__()
         self.existing_wrapper = existing_wrapper
+        # None: normalize against the first sigma of the current sampler call.
+        # A positive value: normalize against that fixed sigma instead, so the
+        # window addresses absolute noise levels in every sampler call.
+        if reference_sigma is not None:
+            reference_sigma = float(reference_sigma)
+            if not math.isfinite(reference_sigma) or reference_sigma <= _EPSILON:
+                raise ValueError("Diff-Aid reference sigma must be finite and positive.")
+        self.reference_sigma = reference_sigma
         self._first_sigma_abs: Optional[float] = None
         self._last_sigma_abs: Optional[float] = None
 
@@ -663,6 +685,13 @@ class SharedTimestepWrapper(nn.Module):
         t = _as_float_tensor(timestep, device=device)
         if t is None or t.numel() == 0:
             return torch.tensor([1.0], device=device, dtype=torch.float32)
+
+        if self.reference_sigma is not None:
+            # Independent of the schedule of the current sampler call and of
+            # earlier calls; the recorded pair mirrors the other branches.
+            self._first_sigma_abs = self.reference_sigma
+            self._last_sigma_abs = float(t.abs().max().item())
+            return (t.abs() / self.reference_sigma).clamp(0.0, 1.0)
 
         transformer_options = transformer_options or {}
         scheduled_first_sigma = _max_abs_positive(transformer_options.get("sample_sigmas", None), device=device)
@@ -1352,7 +1381,23 @@ class Krea2DiffAidSparsePatchNode:
                 "token_weight_mode": (["none", "linear", "exponential"], {"default": "none"}),
                 "token_tail": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01, "advanced": True}),
                 "cond_only": ("BOOLEAN", {"default": True, "advanced": True}),
-            }
+            },
+            "optional": {
+                "sigma_reference": (
+                    list(KREA2_SIGMA_REFERENCES),
+                    {
+                        "default": "schedule_start",
+                        "advanced": True,
+                        "tooltip": (
+                            "What normalized sigma 1.0 means for sigma_start/sigma_end. "
+                            "schedule_start: the first sigma of the current sampler call, so a partial-denoise "
+                            "or refinement pass spans the whole window again from 1.0. "
+                            "model_sigma_max: the model's maximum sigma, so the window addresses the same "
+                            "absolute noise levels in every sampler call."
+                        ),
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("MODEL", "STRING")
@@ -1374,6 +1419,7 @@ class Krea2DiffAidSparsePatchNode:
         token_weight_mode: str = "none",
         token_tail: float = 0.35,
         cond_only: bool = True,
+        sigma_reference: str = "schedule_start",
     ):
         custom = _cache_str(block_preset) == "custom_block_indices"
         return (
@@ -1381,6 +1427,7 @@ class Krea2DiffAidSparsePatchNode:
             _cache_str(block_preset),
             _cache_block_indices(block_indices) if custom else "",
             _cache_str(modulation_target),
+            _cache_str(sigma_reference),
             *_shared_config_fingerprint(
                 enabled=enabled,
                 strength=strength,
@@ -1407,6 +1454,7 @@ class Krea2DiffAidSparsePatchNode:
         token_weight_mode: str,
         token_tail: float,
         cond_only: bool = True,
+        sigma_reference: str = "schedule_start",
     ):
         if not enabled:
             return model, "disabled"
@@ -1414,6 +1462,8 @@ class Krea2DiffAidSparsePatchNode:
             return model, "zero strength (no patch)"
         if sigma_start > sigma_end:
             raise ValueError(f"sigma_start ({sigma_start}) must be <= sigma_end ({sigma_end}).")
+        if sigma_reference not in KREA2_SIGMA_REFERENCES:
+            raise ValueError(f"Unsupported Krea 2 sigma reference: {sigma_reference}.")
         total = _get_krea2_block_count(model)
         if block_preset == "uniform_five_experimental":
             indices = _remap_stage_indices(KREA2_EXPERIMENTAL_BLOCKS, 28, total)
@@ -1433,9 +1483,16 @@ class Krea2DiffAidSparsePatchNode:
         # text_residual: scale text rows of selected block inputs (Flux
         # single-stream equivalent) via a diffusion-model wrapper.
         # values_only / keys_and_values: attn1_patch after per-head QK norm.
+        reference_sigma = _model_sigma_max(model) if sigma_reference == "model_sigma_max" else None
         patched = model.clone()
         previous_wrapper = patched.model_options.get("model_function_wrapper")
-        patched.set_model_unet_function_wrapper(SharedTimestepWrapper(existing_wrapper=previous_wrapper))
+        if (isinstance(previous_wrapper, SharedTimestepWrapper)
+                and previous_wrapper.reference_sigma != reference_sigma):
+            # Stacked Diff-Aid patches read one shared normalized sigma.
+            raise ValueError("Stacked Diff-Aid patches on one model must use the same sigma_reference.")
+        patched.set_model_unet_function_wrapper(
+            SharedTimestepWrapper(existing_wrapper=previous_wrapper, reference_sigma=reference_sigma)
+        )
         selected = [index - 1 for index in indices]
         if modulation_target == "text_residual":
             add_wrapper = getattr(patched, "add_wrapper_with_key", None)
@@ -1452,7 +1509,8 @@ class Krea2DiffAidSparsePatchNode:
             f"krea2_sparse preset={block_preset}; mapped_blocks_1based=[{_fmt_ints(indices)}]; "
             f"model_total_blocks={total}; modulation_target={modulation_target}; "
             f"strength={config.strength:.3f}; normalized_sigma_window=[{config.sigma_start:.3f}, {config.sigma_end:.3f}]; "
-            f"ramp={config.sigma_ramp:.3f}; token_weight_mode={config.token_weight_mode}; "
+            f"ramp={config.sigma_ramp:.3f}; sigma_reference={sigma_reference}; "
+            f"token_weight_mode={config.token_weight_mode}; "
             f"token_tail={config.token_tail:.3f}; cond_only={str(config.cond_only).lower()}; "
             f"scope=text_{modulation_target}; paper_validation=none"
         )

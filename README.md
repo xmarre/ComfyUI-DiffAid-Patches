@@ -563,6 +563,7 @@ ComfyUI Krea 2 joins **text tokens first**, then target image and optional refer
 - `block_preset = custom_block_indices`: explicit 1-based comma-separated indices in the detected block range.
 - `strength = 0.15` by default; `0` returns the untouched model, as does `enabled = False`.
 - `sigma_start = 0.0`, `sigma_end = 1.0`, `sigma_ramp = 0.0`: full normalized noise range, with optional shorter/smoothed windows.
+- `sigma_reference = schedule_start | model_sigma_max` (advanced, default `schedule_start`): what normalized sigma `1.0` means for the window; see [Sigma reference for partial-denoise and multi-pass sampling](#sigma-reference-for-partial-denoise-and-multi-pass-sampling).
 - `token_weight_mode = none | linear | exponential`; `token_tail` controls decay for non-`none` choices.
 - `cond_only = True`: leave unconditional rows unchanged when ComfyUI provides `cond_or_uncond` metadata.
 
@@ -602,6 +603,28 @@ The normalized sigma level is derived from the model-call timestep/sigma sequenc
 - `0.0` means the low-noise end
 
 This avoids comparing raw ComfyUI timestep/sigma units against normalized UI controls.
+
+### Sigma reference for partial-denoise and multi-pass sampling
+
+Normalizing against the first sigma of the current sampler call means every sampler call spans the whole window again. A full-denoise call starts at the model's maximum sigma, so the normalized level equals the absolute noise level. A call that starts lower — img2img / partial denoise, or each pass of a multi-pass refinement sampler — also starts at normalized `1.0`, so a partial window is re-applied relative to that pass instead of to the absolute noise level.
+
+Example: a hard window `sigma_start = 0.75`, `sigma_end = 1.0` on a flow model, and a refinement pass over sigmas `0.558, 0.463, 0.345, 0.196`:
+
+| Sigma | `schedule_start` normalized level | Gain | `model_sigma_max` normalized level | Gain |
+|---:|---:|---:|---:|---:|
+| 0.558 | 1.000 | 1 | 0.558 | 0 |
+| 0.463 | 0.829 | 1 | 0.463 | 0 |
+| 0.345 | 0.618 | 0 | 0.345 | 0 |
+| 0.196 | 0.350 | 0 | 0.196 | 0 |
+
+The Krea 2 node exposes this choice as `sigma_reference`:
+
+- `schedule_start` (default): `1.0` is the first sigma of the current sampler call. Existing workflows are unchanged.
+- `model_sigma_max`: `1.0` is the maximum sigma of the model's sampling schedule, read when the node is applied (`1.0` for Krea 2). The window then selects the same absolute noise levels in every sampler call, and a pass that lies entirely on one side of a window boundary keeps one constant gain.
+
+The two settings are identical for sampler calls that start at the model's maximum sigma. They differ for calls that start lower, where `model_sigma_max` changes which steps are modulated and therefore the image; compare both at a matched seed before adopting one. Patches stacked on one model share a single normalized sigma and must use the same `sigma_reference`.
+
+A feature-forecasting accelerator that keeps separate history per Diff-Aid gain must re-evaluate the model whenever the gain changes. With `schedule_start`, a window boundary is crossed inside every short refinement pass, which can leave such a pass without any forecast; with `model_sigma_max` the gain changes only where the absolute noise level crosses a boundary.
 
 ### Token weighting modes
 
